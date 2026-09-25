@@ -1,0 +1,8 @@
+these 3 derivations will be built:
+  /nix/store/1qyxd2bb309c96blvcr7xzbk8y5dn9la-build-fail.drv
+  /nix/store/xda5gh25xggvbr0yh19gjmbwv5fyp96p-build-long.drv
+  /nix/store/z91hfxk75p5p8hdc78lqnczqp36mb23l-build-waiting.drv
+building '/nix/store/1qyxd2bb309c96blvcr7xzbk8y5dn9la-build-fail.drv'...
+building '/nix/store/xda5gh25xggvbr0yh19gjmbwv5fyp96p-build-long.drv'...
+error: builder for '/nix/store/1qyxd2bb309c96blvcr7xzbk8y5dn9la-build-fail.drv' failed with exit code 1
+error: build of '/nix/store/1qyxd2bb309c96blvcr7xzbk8y5dn9la-build-fail.drv', '/nix/store/xda5gh25xggvbr0yh19gjmbwv5fyp96p-build-long.drv', '/nix/store/z91hfxk75p5p8hdc78lqnczqp36mb23l-build-waiting.drv' failed
