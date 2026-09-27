@@ -86,17 +86,16 @@ pub fn monitor_stream<R: Read + Send + 'static>(
         }
     });
 
-    let frame_ticker = tick(Duration::from_millis(60));
-    let second_ticker = tick(Duration::from_millis(1000));
+    let frame_ticker = tick(Duration::from_millis(50));
     let mut dirty = true;
     let mut pending_log_lines: Vec<String> = Vec::new();
     let mut last_draw = Instant::now();
+    let mut last_rendered_sec: u64 = 0;
 
     'main_loop: loop {
-        let now = start_instant.elapsed().as_secs_f64();
-
         select! {
             recv(input_rx) -> event => {
+                let now = start_instant.elapsed().as_secs_f64();
                 let mut current_event = event;
                 let batch_start = Instant::now();
                 let mut batch_count = 0;
@@ -131,10 +130,10 @@ pub fn monitor_stream<R: Read + Send + 'static>(
                     }
                 }
 
-                // If dirty and at least 60ms elapsed since last draw (or logs need to be printed), redraw now!
+                // If dirty and at least 50ms elapsed since last draw (or logs need to be printed), redraw now!
                 let now_instant = Instant::now();
                 if (dirty || !pending_log_lines.is_empty())
-                    && now_instant.duration_since(last_draw) >= Duration::from_millis(60)
+                    && now_instant.duration_since(last_draw) >= Duration::from_millis(50)
                 {
                     let current_now = start_instant.elapsed().as_secs_f64();
                     maintain_nom_state(&mut state, current_now);
@@ -143,9 +142,11 @@ pub fn monitor_stream<R: Read + Send + 'static>(
                     pending_log_lines.clear();
                     dirty = false;
                     last_draw = now_instant;
+                    last_rendered_sec = current_now.floor() as u64;
                 }
             }
             recv(watcher.event_receiver) -> finished_build => {
+                let now = start_instant.elapsed().as_secs_f64();
                 if let Ok((host, drv_id)) = finished_build {
                     finish_build_by_drv_id(&mut state, &host, drv_id, now, &reports_writer);
                     dirty = true;
@@ -157,24 +158,19 @@ pub fn monitor_stream<R: Read + Send + 'static>(
             }
             recv(frame_ticker) -> _ => {
                 let now_instant = Instant::now();
-                if dirty || !pending_log_lines.is_empty() {
-                    maintain_nom_state(&mut state, now);
-                    let rendered = render_state_to_text(&state, config, now);
+                let current_now = start_instant.elapsed().as_secs_f64();
+                let current_sec = current_now.floor() as u64;
+                let second_advanced = current_sec > last_rendered_sec;
+
+                if dirty || !pending_log_lines.is_empty() || second_advanced {
+                    maintain_nom_state(&mut state, current_now);
+                    let rendered = render_state_to_text(&state, config, current_now);
                     terminal.draw(&pending_log_lines, &rendered, !config.silent);
                     pending_log_lines.clear();
                     dirty = false;
                     last_draw = now_instant;
+                    last_rendered_sec = current_sec;
                 }
-            }
-            recv(second_ticker) -> _ => {
-                // Periodically update stopwatch and historical estimates
-                let now_instant = Instant::now();
-                maintain_nom_state(&mut state, now);
-                let rendered = render_state_to_text(&state, config, now);
-                terminal.draw(&pending_log_lines, &rendered, !config.silent);
-                pending_log_lines.clear();
-                dirty = false;
-                last_draw = now_instant;
             }
         }
     }
@@ -371,12 +367,18 @@ fn process_json_message(
                 }
             }
             crate::parser::json::ActivityResult::Progress(progress) => {
+                let mut changed = false;
                 if let Some(act) = state.activities.get_mut(&action.id) {
-                    act.progress = Some(progress);
-                    true
-                } else {
-                    false
+                    act.progress = Some(progress.clone());
+                    changed = true;
                 }
+                if let Some(&parent_id) = state.activity_parents.get(&action.id) {
+                    if let Some(parent_act) = state.activities.get_mut(&parent_id) {
+                        parent_act.file_transfer_progress = Some(progress);
+                        changed = true;
+                    }
+                }
+                changed
             }
             _ => false,
         },
@@ -406,18 +408,24 @@ fn process_json_message(
                 _ => false,
             };
 
+            if let Some(parent_id) = action.parent {
+                state.activity_parents.insert(action.id, parent_id);
+            }
+
             state.activities.insert(
                 action.id,
                 ActivityStatus {
                     activity: action.activity,
                     phase: None,
                     progress: None,
+                    file_transfer_progress: None,
                 },
             );
 
             changed
         }
         NixJsonMessage::Stop(action) => {
+            state.activity_parents.remove(&action.id);
             if let Some(act_status) = state.activities.get(&action.id).cloned() {
                 match act_status.activity {
                     Activity::CopyPath { path, from, to } => {
@@ -521,7 +529,8 @@ fn process_old_style_message(
                 }
                 true
             }
-            NixOldStyleMessage::PlanDownloads(_, _, paths) => {
+            NixOldStyleMessage::PlanDownloads(download_size, _, paths) => {
+                state.planned_download_bytes = Some(download_size as usize);
                 for p in paths {
                     let path_id = state.get_store_path_id(&p);
                     let old_states = state.get_store_path(path_id).states.clone();

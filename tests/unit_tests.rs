@@ -537,6 +537,7 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
                 running: 1,
                 failed: 0,
             }),
+            file_transfer_progress: None,
         },
     );
 
@@ -986,5 +987,288 @@ fn test_inert_unknown_derivations_pruned() {
     assert!(
         !rendered.contains("gnused"),
         "Rendered tree must NOT contain gnused"
+    );
+}
+
+#[test]
+fn test_localhost_presence_and_order_before_builds() {
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use nix_output_monitor::state::{NomState, TransferInfo};
+    use nix_output_monitor::types::{Derivation, Host, StorePath};
+    use std::collections::HashMap;
+
+    let mut state = NomState::new(0.0, None, HashMap::new());
+
+    // 1 planned build on localhost, but NOT yet building
+    let drv = Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo-1.0.drv").unwrap();
+    let drv_id = state.get_derivation_id(&drv);
+    state.get_derivation_mut(drv_id).build_status = nix_output_monitor::state::BuildStatus::Planned;
+    state.full_summary.planned_builds.insert(drv_id);
+
+    // 1 running download from cache.nixos.org
+    let sp = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-1.0").unwrap();
+    let sp_id = state.get_store_path_id(&sp);
+    state.full_summary.running_downloads.insert(
+        sp_id,
+        TransferInfo {
+            host: Host::parse("https://cache.nixos.org"),
+            start: 0.0,
+            activity_id: None,
+            end: (),
+        },
+    );
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let rendered = render_state_to_text(&state, config, 1.0);
+
+    // Both localhost and cache.nixos.org must be present
+    assert!(
+        rendered.contains("localhost"),
+        "Table must display localhost even before builds start"
+    );
+    assert!(
+        rendered.contains("cache.nixos.org"),
+        "Table must display cache.nixos.org"
+    );
+
+    // localhost must appear BEFORE cache.nixos.org
+    let pos_localhost = rendered.find("localhost").unwrap();
+    let pos_cache = rendered.find("cache.nixos.org").unwrap();
+    assert!(
+        pos_localhost < pos_cache,
+        "localhost (pos {}) must appear before cache.nixos.org (pos {})",
+        pos_localhost,
+        pos_cache
+    );
+}
+
+#[test]
+fn test_compressed_download_size_preferred_over_unpacked() {
+    use nix_output_monitor::parser::json::{Activity, ActivityProgress};
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use nix_output_monitor::state::{ActivityStatus, NomState, TransferInfo};
+    use nix_output_monitor::types::{Host, StorePath};
+    use std::collections::HashMap;
+
+    let mut state = NomState::new(0.0, None, HashMap::new());
+    let act_id = 100;
+    let sp = StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-source").unwrap();
+    let sp_id = state.get_store_path_id(&sp);
+
+    // CopyPath progress indicates unpacked NAR size: 200 MiB (209715200 bytes)
+    // Child FileTransfer progress indicates compressed download size: 48 MiB (50331648 bytes)
+    state.activities.insert(
+        act_id,
+        ActivityStatus {
+            activity: Activity::CopyPath {
+                path: sp.clone(),
+                from: Host::parse("https://cache.nixos.org"),
+                to: Host::Localhost,
+            },
+            phase: None,
+            progress: Some(ActivityProgress {
+                done: 209715200,
+                expected: 209715200,
+                running: 1,
+                failed: 0,
+            }),
+            file_transfer_progress: Some(ActivityProgress {
+                done: 50331648,
+                expected: 50331648,
+                running: 1,
+                failed: 0,
+            }),
+        },
+    );
+
+    state.full_summary.running_downloads.insert(
+        sp_id,
+        TransferInfo {
+            host: Host::parse("https://cache.nixos.org"),
+            start: 0.0,
+            activity_id: Some(act_id),
+            end: (),
+        },
+    );
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let rendered = render_state_to_text(&state, config, 1.0);
+
+    // It should display 48.0 MiB, NOT 200.0 MiB
+    assert!(
+        rendered.contains("48.0 MiB"),
+        "Rendered output must show compressed download size (48.0 MiB), got: \n{}",
+        rendered
+    );
+    assert!(
+        !rendered.contains("200.0 MiB"),
+        "Rendered output must NOT show unpacked NAR size (200.0 MiB)"
+    );
+}
+
+#[test]
+fn test_single_substituter_does_not_display_from_abbrev() {
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use nix_output_monitor::state::{BuildInfo, NomState, TransferInfo};
+    use nix_output_monitor::types::{Derivation, Host, OutputName, StorePath};
+    use std::collections::HashMap;
+
+    let mut state = NomState::new(0.0, None, HashMap::new());
+
+    // 1 local build on localhost
+    let drv_build =
+        Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo-1.0.drv").unwrap();
+    let drv_build_id = state.get_derivation_id(&drv_build);
+    state.full_summary.running_builds.insert(
+        drv_build_id,
+        BuildInfo {
+            start: 0.0,
+            host: Host::Localhost,
+            estimate: None,
+            activity_id: None,
+            end: (),
+        },
+    );
+    state.forest_roots.push(drv_build_id);
+
+    // 1 download from the only substituter: cache.nixos.org
+    let sp = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-1.0").unwrap();
+    let sp_id = state.get_store_path_id(&sp);
+    let dl_info = TransferInfo {
+        host: Host::parse("https://cache.nixos.org"),
+        start: 0.0,
+        activity_id: None,
+        end: (),
+    };
+    state
+        .full_summary
+        .running_downloads
+        .insert(sp_id, dl_info.clone());
+
+    let drv_dl =
+        Derivation::parse("/nix/store/11111111111111111111111111111111-dep-1.0.drv").unwrap();
+    let drv_dl_id = state.get_derivation_id(&drv_dl);
+    state
+        .get_derivation_mut(drv_dl_id)
+        .outputs
+        .insert(OutputName::Out, sp_id);
+    state
+        .get_derivation_mut(drv_dl_id)
+        .dependency_summary
+        .running_downloads
+        .insert(sp_id, dl_info);
+    state.forest_roots.push(drv_dl_id);
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let rendered = render_state_to_text(&state, config, 1.0);
+
+    // Tree must contain dep-1.0
+    assert!(
+        rendered.contains("dep-1.0"),
+        "Rendered tree must contain dep-1.0: \n{}",
+        rendered
+    );
+    // Should NOT contain "from cn" or "from cache.nixos.org"
+    assert!(
+        !rendered.contains("from cn"),
+        "Rendered tree must NOT contain 'from cn' when only 1 substituter exists: \n{}",
+        rendered
+    );
+    assert!(
+        !rendered.contains("from cache"),
+        "Rendered tree must NOT contain 'from cache': \n{}",
+        rendered
+    );
+}
+
+#[test]
+fn test_multiple_substituters_display_from_abbrev() {
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use nix_output_monitor::state::{NomState, TransferInfo};
+    use nix_output_monitor::types::{Derivation, Host, OutputName, StorePath};
+    use std::collections::HashMap;
+
+    let mut state = NomState::new(0.0, None, HashMap::new());
+
+    // 2 downloads from 2 different substituters
+    let sp1 = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-1.0").unwrap();
+    let sp1_id = state.get_store_path_id(&sp1);
+    let dl1_info = TransferInfo {
+        host: Host::parse("https://cache.nixos.org"),
+        start: 0.0,
+        activity_id: None,
+        end: (),
+    };
+    state
+        .full_summary
+        .running_downloads
+        .insert(sp1_id, dl1_info.clone());
+
+    let drv1 =
+        Derivation::parse("/nix/store/11111111111111111111111111111111-dep-1.0.drv").unwrap();
+    let drv1_id = state.get_derivation_id(&drv1);
+    state
+        .get_derivation_mut(drv1_id)
+        .outputs
+        .insert(OutputName::Out, sp1_id);
+    state
+        .get_derivation_mut(drv1_id)
+        .dependency_summary
+        .running_downloads
+        .insert(sp1_id, dl1_info);
+    state.forest_roots.push(drv1_id);
+
+    let sp2 = StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-dep-2.0").unwrap();
+    let sp2_id = state.get_store_path_id(&sp2);
+    let dl2_info = TransferInfo {
+        host: Host::parse("https://cuda-maintainers.cachix.org"),
+        start: 0.0,
+        activity_id: None,
+        end: (),
+    };
+    state
+        .full_summary
+        .running_downloads
+        .insert(sp2_id, dl2_info.clone());
+
+    let drv2 =
+        Derivation::parse("/nix/store/22222222222222222222222222222222-dep-2.0.drv").unwrap();
+    let drv2_id = state.get_derivation_id(&drv2);
+    state
+        .get_derivation_mut(drv2_id)
+        .outputs
+        .insert(OutputName::Out, sp2_id);
+    state
+        .get_derivation_mut(drv2_id)
+        .dependency_summary
+        .running_downloads
+        .insert(sp2_id, dl2_info);
+    state.forest_roots.push(drv2_id);
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let rendered = render_state_to_text(&state, config, 1.0);
+
+    // Should contain "from cn" and "from cc"
+    assert!(
+        rendered.contains("from cn"),
+        "Rendered tree MUST contain 'from cn' when multiple substituters exist: \n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("from cc"),
+        "Rendered tree MUST contain 'from cc' when multiple substituters exist: \n{}",
+        rendered
     );
 }

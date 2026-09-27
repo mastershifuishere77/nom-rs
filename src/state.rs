@@ -253,6 +253,7 @@ pub struct ActivityStatus {
     pub activity: Activity,
     pub phase: Option<String>,
     pub progress: Option<ActivityProgress>,
+    pub file_transfer_progress: Option<ActivityProgress>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,6 +282,8 @@ pub struct NomState {
     pub derivation_ids: HashMap<Derivation, DerivationId>,
     pub touched_ids: BTreeSet<DerivationId>,
     pub activities: HashMap<u64, ActivityStatus>,
+    pub activity_parents: HashMap<u64, u64>,
+    pub planned_download_bytes: Option<usize>,
     pub nix_errors: Vec<String>,
     pub nix_traces: Vec<String>,
     pub build_platform: Option<String>,
@@ -303,6 +306,8 @@ impl NomState {
             derivation_ids: HashMap::new(),
             touched_ids: BTreeSet::new(),
             activities: HashMap::new(),
+            activity_parents: HashMap::new(),
+            planned_download_bytes: None,
             nix_errors: Vec::new(),
             nix_traces: Vec::new(),
             build_platform,

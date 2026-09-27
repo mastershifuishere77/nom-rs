@@ -581,7 +581,7 @@ fn format_derivation_row(
             ));
         }
         if !prog_text.is_empty() {
-            parts.push(format!("{}{}{}", GREEN, prog_text.trim(), RESET));
+            parts.push(format!("{}{} {}{}", GREEN, DOWN, prog_text.trim(), RESET));
         }
         parts.join(" ")
     } else if !running_uploads.is_empty() {
@@ -609,7 +609,7 @@ fn format_derivation_row(
             ));
         }
         if !prog_text.is_empty() {
-            parts.push(format!("{}{}{}", GREEN, prog_text.trim(), RESET));
+            parts.push(format!("{}{} {}{}", GREEN, UP, prog_text.trim(), RESET));
         }
         parts.join(" ")
     } else {
@@ -622,7 +622,11 @@ fn format_derivation_row(
                         .iter()
                         .filter_map(|d| d.activity_id)
                         .filter_map(|act_id| state.activities.get(&act_id))
-                        .filter_map(|act| act.progress.as_ref())
+                        .filter_map(|act| {
+                            act.file_transfer_progress
+                                .as_ref()
+                                .or(act.progress.as_ref())
+                        })
                         .map(|p| p.expected)
                         .sum();
                     let mut parts = Vec::new();
@@ -644,7 +648,11 @@ fn format_derivation_row(
                         .iter()
                         .filter_map(|u| u.activity_id)
                         .filter_map(|act_id| state.activities.get(&act_id))
-                        .filter_map(|act| act.progress.as_ref())
+                        .filter_map(|act| {
+                            act.file_transfer_progress
+                                .as_ref()
+                                .or(act.progress.as_ref())
+                        })
                         .map(|p| p.expected)
                         .sum();
                     let mut parts = Vec::new();
@@ -769,7 +777,11 @@ fn compute_transfer_progress<T>(
     for t in transfers {
         if let Some(act_id) = t.activity_id {
             if let Some(act) = state.activities.get(&act_id) {
-                if let Some(ref p) = act.progress {
+                if let Some(p) = act
+                    .file_transfer_progress
+                    .as_ref()
+                    .or(act.progress.as_ref())
+                {
                     total_done += p.done;
                     total_expected += p.expected;
                 }
@@ -925,7 +937,22 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
         host_expected: usize,
     }
 
+    static LOCALHOST: Host = Host::Localhost;
     let mut host_stats: HashMap<&str, HostStats> = HashMap::new();
+    host_stats.insert(
+        LOCALHOST.hostname_only(),
+        HostStats {
+            host: &LOCALHOST,
+            rb: 0,
+            cb: 0,
+            rd: 0,
+            cd: 0,
+            ru: 0,
+            cu: 0,
+            host_done: 0,
+            host_expected: 0,
+        },
+    );
     let mut total_done = 0;
     let mut total_expected = 0;
 
@@ -978,7 +1005,11 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
         stats.rd += 1;
         if let Some(act_id) = d.activity_id {
             if let Some(act) = state.activities.get(&act_id) {
-                if let Some(ref p) = act.progress {
+                if let Some(p) = act
+                    .file_transfer_progress
+                    .as_ref()
+                    .or(act.progress.as_ref())
+                {
                     stats.host_done += p.done;
                     stats.host_expected += p.expected;
                     total_done += p.done;
@@ -1004,7 +1035,11 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
         stats.cd += 1;
         if let Some(act_id) = d.activity_id {
             if let Some(act) = state.activities.get(&act_id) {
-                if let Some(ref p) = act.progress {
+                if let Some(p) = act
+                    .file_transfer_progress
+                    .as_ref()
+                    .or(act.progress.as_ref())
+                {
                     let d_done = p.expected.max(p.done);
                     stats.host_done += d_done;
                     stats.host_expected += p.expected;
@@ -1071,7 +1106,17 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
     // Host rows if show_hosts
     if show_hosts {
         let mut sorted_keys: Vec<&str> = host_stats.keys().copied().collect();
-        sorted_keys.sort_unstable();
+        sorted_keys.sort_by(|a, b| {
+            if *a == "localhost" {
+                return std::cmp::Ordering::Less;
+            }
+            if *b == "localhost" {
+                return std::cmp::Ordering::Greater;
+            }
+            let a_rev: Vec<&str> = a.split('.').rev().collect();
+            let b_rev: Vec<&str> = b.split('.').rev().collect();
+            a_rev.cmp(&b_rev)
+        });
         for h in sorted_keys {
             let stats = &host_stats[h];
             let host_display = stats.host.format_with_proto_context();
@@ -1154,6 +1199,16 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 ))
                 .green(),
             );
+        } else if let Some(planned_bytes) = state.planned_download_bytes {
+            total_row.push(
+                Entry::text(format!(
+                    "{} {}/{}",
+                    DOWN,
+                    print_bytes(total_done),
+                    print_bytes(planned_bytes)
+                ))
+                .green(),
+            );
         } else {
             total_row.push(Entry::text(""));
         }
@@ -1220,20 +1275,44 @@ pub fn non_zero_entry(symbol: &str, count: usize, color_fn: impl Fn(Entry) -> En
 }
 
 fn compute_host_abbrevs(state: &NomState) -> HashMap<String, String> {
-    let mut hosts: HashSet<&str> = HashSet::new();
+    let mut remote_hosts: HashSet<&str> = HashSet::new();
     for drv in state.full_summary.running_builds.values() {
-        hosts.insert(drv.host.hostname_only());
+        if let Host::Remote { ref host, .. } = drv.host {
+            remote_hosts.insert(host.as_str());
+        }
+    }
+    for drv in state.full_summary.completed_builds.values() {
+        if let Host::Remote { ref host, .. } = drv.host {
+            remote_hosts.insert(host.as_str());
+        }
     }
     for tr in state.full_summary.running_downloads.values() {
-        hosts.insert(tr.host.hostname_only());
+        if let Host::Remote { ref host, .. } = tr.host {
+            remote_hosts.insert(host.as_str());
+        }
+    }
+    for tr in state.full_summary.completed_downloads.values() {
+        if let Host::Remote { ref host, .. } = tr.host {
+            remote_hosts.insert(host.as_str());
+        }
+    }
+    for tr in state.full_summary.running_uploads.values() {
+        if let Host::Remote { ref host, .. } = tr.host {
+            remote_hosts.insert(host.as_str());
+        }
+    }
+    for tr in state.full_summary.completed_uploads.values() {
+        if let Host::Remote { ref host, .. } = tr.host {
+            remote_hosts.insert(host.as_str());
+        }
     }
 
-    if hosts.len() <= 1 {
+    if remote_hosts.len() <= 1 {
         return HashMap::new();
     }
 
-    let mut map = HashMap::with_capacity(hosts.len());
-    for h in hosts {
+    let mut map = HashMap::with_capacity(remote_hosts.len());
+    for h in remote_hosts {
         let parts: Vec<&str> = h.split('.').collect();
         let abbrev = if parts.len() >= 2 {
             format!(

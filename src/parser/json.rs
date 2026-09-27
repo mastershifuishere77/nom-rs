@@ -85,6 +85,7 @@ pub enum ActivityResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartAction {
     pub id: u64,
+    pub parent: Option<u64>,
     pub level: Verbosity,
     pub text: String,
     pub activity: Activity,
@@ -124,6 +125,8 @@ struct RawJsonMessage<'a> {
     #[serde(default)]
     id: Option<u64>,
     #[serde(default)]
+    parent: Option<u64>,
+    #[serde(default)]
     level: Option<u64>,
     #[serde(default)]
     text: Option<String>,
@@ -150,6 +153,7 @@ pub fn parse_json_line(line: &str) -> NixJsonMessage {
     match raw.action {
         "start" => {
             let id = raw.id.unwrap_or(0);
+            let parent = raw.parent;
             let level = Verbosity::from_u64(raw.level.unwrap_or(3));
             let text = raw.text.unwrap_or_default();
             let act_type = raw.msg_type.unwrap_or(0);
@@ -253,6 +257,7 @@ pub fn parse_json_line(line: &str) -> NixJsonMessage {
 
             NixJsonMessage::Start(StartAction {
                 id,
+                parent,
                 level,
                 text,
                 activity,
