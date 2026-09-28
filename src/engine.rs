@@ -246,8 +246,8 @@ pub fn parallel_prefetch_derivations(drvs: &[Derivation]) -> Vec<(Derivation, Pa
     if drvs.is_empty() {
         return Vec::new();
     }
-    if drvs.len() == 1 {
-        return read_and_parse_derivation(&drvs[0]).into_iter().collect();
+    if drvs.len() <= 3 {
+        return drvs.iter().filter_map(read_and_parse_derivation).collect();
     }
 
     let num_threads = std::thread::available_parallelism()
@@ -662,6 +662,7 @@ fn mark_building(
     activity_id: Option<u64>,
 ) {
     let drv_id = lookup_derivation(state, drv);
+    state.register_host(host);
     let drv_info = state.get_derivation(drv_id);
     let report_name = drv_info.get_report_name().to_string();
     let host_wc = host.without_context();
@@ -773,7 +774,15 @@ fn update_derivation_state(
     let parents_vec: Vec<DerivationId> = parents.iter().copied().collect();
     state.update_parents(
         false,
-        |sum| NomState::update_summary_for_derivation(sum, &old_status, &new_status, drv_id),
+        |sum| {
+            NomState::update_summary_for_derivation_opt(
+                sum,
+                &old_status,
+                &new_status,
+                drv_id,
+                false,
+            )
+        },
         |sum| NomState::clear_derivation_id_from_summary(sum, &old_status, drv_id),
         &parents_vec,
     );
@@ -787,6 +796,7 @@ fn start_downloading(
     start: f64,
     activity_id: Option<u64>,
 ) {
+    state.register_host(&from);
     let old_states = state.get_store_path(path_id).states.clone();
     let mut new_states = old_states.clone();
     new_states.remove(&StorePathState::DownloadPlanned);
@@ -800,6 +810,7 @@ fn start_downloading(
 }
 
 fn finish_downloading(state: &mut NomState, path_id: StorePathId, from: Host, end: f64) {
+    state.register_host(&from);
     let old_states = state.get_store_path(path_id).states.clone();
     let mut new_states = old_states.clone();
 
@@ -832,6 +843,7 @@ fn start_uploading(
     start: f64,
     activity_id: Option<u64>,
 ) {
+    state.register_host(&to);
     let old_states = state.get_store_path(path_id).states.clone();
     let mut new_states = old_states.clone();
     new_states.insert(StorePathState::Uploading(TransferInfo {
@@ -844,6 +856,7 @@ fn start_uploading(
 }
 
 fn finish_uploading(state: &mut NomState, path_id: StorePathId, to: Host, end: f64) {
+    state.register_host(&to);
     let old_states = state.get_store_path(path_id).states.clone();
     let mut new_states = old_states.clone();
 
@@ -896,7 +909,15 @@ fn update_store_path_states(
 
     state.update_parents(
         true,
-        |sum| NomState::update_summary_for_store_path(sum, &old_states, &new_states, path_id),
+        |sum| {
+            NomState::update_summary_for_store_path_opt(
+                sum,
+                &old_states,
+                &new_states,
+                path_id,
+                false,
+            )
+        },
         |sum| NomState::clear_store_paths_from_summary(sum, &old_states, path_id),
         &direct_parents,
     );

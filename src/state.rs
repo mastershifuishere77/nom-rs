@@ -290,6 +290,9 @@ pub struct NomState {
     pub interesting_activities: HashMap<u64, InterestingActivity>,
     pub evaluation_state: EvalInfo,
     pub parsed_drv_cache: HashMap<Derivation, crate::parser::derivation::ParsedDerivation>,
+    pub visited_epoch: Vec<u32>,
+    pub current_epoch: u32,
+    pub remote_hosts: BTreeSet<String>,
 }
 
 impl NomState {
@@ -314,6 +317,17 @@ impl NomState {
             interesting_activities: HashMap::new(),
             evaluation_state: EvalInfo::default(),
             parsed_drv_cache: HashMap::new(),
+            visited_epoch: Vec::new(),
+            current_epoch: 0,
+            remote_hosts: BTreeSet::new(),
+        }
+    }
+
+    pub fn register_host(&mut self, host: &Host) {
+        if let Host::Remote { ref host, .. } = host {
+            if !self.remote_hosts.contains(host) {
+                self.remote_hosts.insert(host.clone());
+            }
         }
     }
 
@@ -391,6 +405,16 @@ impl NomState {
         new_status: &BuildStatus,
         drv_id: DerivationId,
     ) {
+        Self::update_summary_for_derivation_opt(summary, old_status, new_status, drv_id, true);
+    }
+
+    pub fn update_summary_for_derivation_opt(
+        summary: &mut DependencySummary,
+        old_status: &BuildStatus,
+        new_status: &BuildStatus,
+        drv_id: DerivationId,
+        is_full_summary: bool,
+    ) {
         Self::clear_derivation_id_from_summary(summary, old_status, drv_id);
         match new_status {
             BuildStatus::Unknown => {}
@@ -409,7 +433,9 @@ impl NomState {
                         .latest_completed_build_end
                         .map_or(bi.end, |cur| cur.max(bi.end)),
                 );
-                summary.completed_builds.insert(drv_id, bi.clone());
+                if is_full_summary {
+                    summary.completed_builds.insert(drv_id, bi.clone());
+                }
             }
         }
     }
@@ -445,13 +471,23 @@ impl NomState {
         new_states: &BTreeSet<StorePathState>,
         path_id: StorePathId,
     ) {
+        Self::update_summary_for_store_path_opt(summary, old_states, new_states, path_id, true);
+    }
+
+    pub fn update_summary_for_store_path_opt(
+        summary: &mut DependencySummary,
+        old_states: &BTreeSet<StorePathState>,
+        new_states: &BTreeSet<StorePathState>,
+        path_id: StorePathId,
+        is_full_summary: bool,
+    ) {
         let deleted = old_states.difference(new_states);
         for state in deleted {
             Self::remove_store_path_state_from_summary(summary, state, path_id);
         }
         let added = new_states.difference(old_states);
         for state in added {
-            Self::insert_store_path_state_into_summary(summary, state, path_id);
+            Self::insert_store_path_state_into_summary(summary, state, path_id, is_full_summary);
         }
     }
 
@@ -469,6 +505,7 @@ impl NomState {
         summary: &mut DependencySummary,
         state: &StorePathState,
         path_id: StorePathId,
+        is_full_summary: bool,
     ) {
         match state {
             StorePathState::DownloadPlanned => {
@@ -486,7 +523,9 @@ impl NomState {
                         .latest_completed_download_start
                         .map_or(info.start, |cur| cur.max(info.start)),
                 );
-                summary.completed_downloads.insert(path_id, info.clone());
+                if is_full_summary {
+                    summary.completed_downloads.insert(path_id, info.clone());
+                }
             }
             StorePathState::Uploaded(info) => {
                 summary.completed_uploads.insert(path_id, info.clone());
@@ -536,45 +575,57 @@ impl NomState {
         }
 
         let num_drvs = self.derivation_infos.len();
-        let mut rel_visited = vec![false; num_drvs];
+        if self.visited_epoch.len() < num_drvs {
+            self.visited_epoch.resize(num_drvs, 0);
+        }
+
+        if self.current_epoch >= u32::MAX - 10 {
+            self.visited_epoch.fill(0);
+            self.current_epoch = 1;
+        } else {
+            self.current_epoch += 1;
+        }
+        let rel_epoch = self.current_epoch;
+        self.current_epoch += 1;
+        let all_epoch = self.current_epoch;
+
         let mut rel_parents = Vec::new();
-        self.collect_parents_fast(true, direct_parents, &mut rel_visited, &mut rel_parents);
+        self.collect_parents_fast_epoch(true, direct_parents, rel_epoch, &mut rel_parents);
 
         if force_direct {
             for &dp in direct_parents {
-                if dp.0 < num_drvs && !rel_visited[dp.0] {
-                    rel_visited[dp.0] = true;
+                if dp.0 < num_drvs && self.visited_epoch[dp.0] != rel_epoch {
+                    self.visited_epoch[dp.0] = rel_epoch;
                     rel_parents.push(dp);
                 }
             }
         }
 
-        let mut all_visited = vec![false; num_drvs];
         let mut all_parents = Vec::new();
-        self.collect_parents_fast(false, direct_parents, &mut all_visited, &mut all_parents);
+        self.collect_parents_fast_epoch(false, direct_parents, all_epoch, &mut all_parents);
 
         for &parent in &rel_parents {
             update_func(&mut self.derivation_infos[parent.0].dependency_summary);
         }
         for &parent in &all_parents {
-            if parent.0 < num_drvs && !rel_visited[parent.0] {
+            if parent.0 < num_drvs && self.visited_epoch[parent.0] != rel_epoch {
                 clear_func(&mut self.derivation_infos[parent.0].dependency_summary);
             }
         }
         self.touched_ids.extend(all_parents);
     }
 
-    fn collect_parents_fast(
-        &self,
+    fn collect_parents_fast_epoch(
+        &mut self,
         no_irrelevant: bool,
         parents_to_scan: &[DerivationId],
-        visited: &mut [bool],
+        epoch: u32,
         collected: &mut Vec<DerivationId>,
     ) {
         let mut queue: Vec<DerivationId> = parents_to_scan.to_vec();
 
         while let Some(current) = queue.pop() {
-            if current.0 >= visited.len() || visited[current.0] {
+            if current.0 >= self.visited_epoch.len() || self.visited_epoch[current.0] == epoch {
                 continue;
             }
 
@@ -598,10 +649,10 @@ impl NomState {
                 || matches!(drv.build_status, BuildStatus::Built(_));
 
             if !(is_irrelevant && no_irrelevant) {
-                visited[current.0] = true;
+                self.visited_epoch[current.0] = epoch;
                 collected.push(current);
                 for &p in &drv.derivation_parents {
-                    if p.0 < visited.len() && !visited[p.0] {
+                    if p.0 < self.visited_epoch.len() && self.visited_epoch[p.0] != epoch {
                         queue.push(p);
                     }
                 }

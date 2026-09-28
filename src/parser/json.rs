@@ -138,12 +138,65 @@ struct RawJsonMessage<'a> {
     fields: Option<Vec<Value>>,
 }
 
+fn try_parse_fast_build_log(json_str: &str) -> Option<(u64, String)> {
+    if !json_str.contains("\"action\":\"result\"") || !json_str.contains("\"type\":101") {
+        return None;
+    }
+
+    let id_marker = "\"id\":";
+    let id_idx = json_str.find(id_marker)? + id_marker.len();
+    let id_rest = &json_str[id_idx..];
+    let end_id = id_rest.find(|c: char| !c.is_ascii_digit())?;
+    let id: u64 = id_rest[..end_id].parse().ok()?;
+
+    let fields_marker = "\"fields\":[\"";
+    let fields_idx = json_str.find(fields_marker)? + fields_marker.len();
+    let rest = &json_str[fields_idx..];
+
+    let bytes = rest.as_bytes();
+    let len = bytes.len();
+    if len >= 2 && bytes[len - 2] == b'"' && bytes[len - 1] == b']' {
+        let content = &rest[..len - 2];
+        if memchr::memchr(b'\\', content.as_bytes()).is_none() {
+            return Some((id, content.to_string()));
+        }
+    }
+
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == b'"' {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    if i < len && rest[i..].starts_with("\"]") {
+        let raw_str = &rest[..i];
+        if memchr::memchr(b'\\', raw_str.as_bytes()).is_none() {
+            return Some((id, raw_str.to_string()));
+        }
+        let unescaped: String = serde_json::from_str(&format!("\"{}\"", raw_str)).ok()?;
+        return Some((id, unescaped));
+    }
+
+    None
+}
+
 pub fn parse_json_line(line: &str) -> NixJsonMessage {
     let trimmed = line.trim_end();
     let json_str = match trimmed.strip_prefix("@nix ") {
         Some(s) => s,
         None => return NixJsonMessage::Plain(trimmed.to_string()),
     };
+
+    if let Some((id, log_line)) = try_parse_fast_build_log(json_str) {
+        return NixJsonMessage::Result(ResultAction {
+            id,
+            result: ActivityResult::BuildLogLine(log_line),
+        });
+    }
 
     let raw: RawJsonMessage = match serde_json::from_str(json_str) {
         Ok(m) => m,

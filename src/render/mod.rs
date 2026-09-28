@@ -304,7 +304,11 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
     // - Derivations that failed (BuildStatus::Failed)
     // - Derivations with running downloads or uploads on their outputs
     // - Derivations associated with running downloads/uploads from state.full_summary
-    let mut active_nodes: HashSet<DerivationId> = HashSet::new();
+    let cap = state.full_summary.failed_builds.len()
+        + state.full_summary.running_builds.len()
+        + state.full_summary.running_downloads.len()
+        + state.full_summary.running_uploads.len();
+    let mut active_nodes: HashSet<DerivationId> = HashSet::with_capacity(cap);
 
     for &drv_id in state.full_summary.failed_builds.keys() {
         active_nodes.insert(drv_id);
@@ -492,6 +496,7 @@ fn build_tree_node(
                 || dep_sum.completed_downloads.contains_key(&path_id)
                 || dep_sum.completed_uploads.contains_key(&path_id)
                 || dep_sum.planned_downloads.contains(&path_id)
+                || !state.get_store_path(path_id).states.is_empty()
         });
     if matches!(drv.build_status, BuildStatus::Unknown)
         && !has_transfers
@@ -528,33 +533,39 @@ fn format_derivation_row(
         || !dep_sum.completed_uploads.is_empty()
         || !dep_sum.planned_downloads.is_empty();
 
-    let mut running_downloads = Vec::new();
-    let mut running_uploads = Vec::new();
-    let mut completed_downloads = Vec::new();
-    let mut completed_uploads = Vec::new();
-
-    if summary_has_transfers {
+    let (
+        running_downloads,
+        running_uploads,
+        completed_downloads,
+        completed_uploads,
+        is_planned_download,
+    ) = if summary_has_transfers {
+        let mut rd = Vec::new();
+        let mut ru = Vec::new();
+        let mut cd = Vec::new();
+        let mut cu = Vec::new();
+        let mut is_pd = false;
         for &path_id in drv.outputs.values() {
             if let Some(dl) = dep_sum.running_downloads.get(&path_id) {
-                running_downloads.push(dl);
+                rd.push(dl);
             }
             if let Some(ul) = dep_sum.running_uploads.get(&path_id) {
-                running_uploads.push(ul);
+                ru.push(ul);
             }
             if let Some(dl) = dep_sum.completed_downloads.get(&path_id) {
-                completed_downloads.push(dl);
+                cd.push(dl);
             }
             if let Some(ul) = dep_sum.completed_uploads.get(&path_id) {
-                completed_uploads.push(ul);
+                cu.push(ul);
+            }
+            if dep_sum.planned_downloads.contains(&path_id) {
+                is_pd = true;
             }
         }
-    }
-
-    let is_planned_download = summary_has_transfers
-        && drv
-            .outputs
-            .values()
-            .any(|p| dep_sum.planned_downloads.contains(p));
+        (rd, ru, cd, cu, is_pd)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
+    };
 
     let row_str = if !running_downloads.is_empty() {
         let (prct, prog_text) = compute_transfer_progress(state, &running_downloads);
@@ -1276,12 +1287,10 @@ pub fn non_zero_entry(symbol: &str, count: usize, color_fn: impl Fn(Entry) -> En
 
 fn compute_host_abbrevs(state: &NomState) -> HashMap<String, String> {
     let mut remote_hosts: HashSet<&str> = HashSet::new();
-    for drv in state.full_summary.running_builds.values() {
-        if let Host::Remote { ref host, .. } = drv.host {
-            remote_hosts.insert(host.as_str());
-        }
+    for h in &state.remote_hosts {
+        remote_hosts.insert(h.as_str());
     }
-    for drv in state.full_summary.completed_builds.values() {
+    for drv in state.full_summary.running_builds.values() {
         if let Host::Remote { ref host, .. } = drv.host {
             remote_hosts.insert(host.as_str());
         }
@@ -1291,17 +1300,7 @@ fn compute_host_abbrevs(state: &NomState) -> HashMap<String, String> {
             remote_hosts.insert(host.as_str());
         }
     }
-    for tr in state.full_summary.completed_downloads.values() {
-        if let Host::Remote { ref host, .. } = tr.host {
-            remote_hosts.insert(host.as_str());
-        }
-    }
     for tr in state.full_summary.running_uploads.values() {
-        if let Host::Remote { ref host, .. } = tr.host {
-            remote_hosts.insert(host.as_str());
-        }
-    }
-    for tr in state.full_summary.completed_uploads.values() {
         if let Host::Remote { ref host, .. } = tr.host {
             remote_hosts.insert(host.as_str());
         }

@@ -59,13 +59,12 @@ impl TerminalRenderer {
                 .sum()
         };
 
-        let nom_lines: Vec<&str> = if nom_output.trim().is_empty() {
-            Vec::new()
+        let is_empty = nom_output.trim().is_empty();
+        let nom_lines_count = if is_empty {
+            0
         } else {
-            nom_output.lines().collect()
+            nom_output.lines().count()
         };
-
-        let nom_lines_count = nom_lines.len();
 
         let lines_to_pad = if pad && nom_lines_count > 0 {
             self.last_printed_line_count
@@ -94,7 +93,11 @@ impl TerminalRenderer {
             .iter()
             .map(|l| l.trim_end_matches('\r'))
             .chain(std::iter::repeat_n("", lines_to_pad))
-            .chain(nom_lines.iter().copied());
+            .chain(if is_empty {
+                "".lines()
+            } else {
+                nom_output.lines()
+            });
 
         for (idx, line) in all_lines.enumerate() {
             if idx == 0 {

@@ -66,11 +66,18 @@ impl StorePath {
 
 #[inline(always)]
 fn is_ascii_alphanumeric_8(chunk: &[u8]) -> bool {
-    let mut ok = true;
-    for &b in chunk {
-        ok &= b.is_ascii_alphanumeric();
+    if chunk.len() < 8 {
+        return false;
     }
-    ok
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = chunk[..8].try_into().unwrap();
+    b0.is_ascii_alphanumeric()
+        && b1.is_ascii_alphanumeric()
+        && b2.is_ascii_alphanumeric()
+        && b3.is_ascii_alphanumeric()
+        && b4.is_ascii_alphanumeric()
+        && b5.is_ascii_alphanumeric()
+        && b6.is_ascii_alphanumeric()
+        && b7.is_ascii_alphanumeric()
 }
 
 #[inline(always)]

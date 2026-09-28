@@ -37,3 +37,11 @@ memchr = "2.7"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false

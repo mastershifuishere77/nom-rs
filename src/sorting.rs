@@ -238,12 +238,16 @@ pub fn sort_order_for_summary_including_root(
         BuildStatus::Failed(bi) => Some(bi.end.at),
         _ => None,
     };
-    let min_failed = summary
-        .failed_builds
-        .values()
-        .map(|f| f.end.at)
-        .chain(status_failed)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let min_failed = if summary.failed_builds.is_empty() {
+        status_failed
+    } else {
+        summary
+            .failed_builds
+            .values()
+            .map(|f| f.end.at)
+            .chain(status_failed)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    };
     if let Some(first_failed) = min_failed {
         return SortOrder::Failed(first_failed);
     }
@@ -252,32 +256,40 @@ pub fn sort_order_for_summary_including_root(
         BuildStatus::Building(bi) => Some(bi.start),
         _ => None,
     };
-    let min_building = summary
-        .running_builds
-        .values()
-        .map(|b| b.start)
-        .chain(status_building)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let min_building = if summary.running_builds.is_empty() {
+        status_building
+    } else {
+        summary
+            .running_builds
+            .values()
+            .map(|b| b.start)
+            .chain(status_building)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    };
     if let Some(first_building) = min_building {
         return SortOrder::Building(first_building);
     }
 
-    if let Some(first_dl) = summary
-        .running_downloads
-        .values()
-        .map(|d| d.start)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Downloading(first_dl);
+    if !summary.running_downloads.is_empty() {
+        if let Some(first_dl) = summary
+            .running_downloads
+            .values()
+            .map(|d| d.start)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            return SortOrder::Downloading(first_dl);
+        }
     }
 
-    if let Some(first_ul) = summary
-        .running_uploads
-        .values()
-        .map(|u| u.start)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Uploading(first_ul);
+    if !summary.running_uploads.is_empty() {
+        if let Some(first_ul) = summary
+            .running_uploads
+            .values()
+            .map(|u| u.start)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            return SortOrder::Uploading(first_ul);
+        }
     }
 
     if !summary.planned_builds.is_empty() || matches!(build_status, BuildStatus::Planned) {
@@ -306,13 +318,15 @@ pub fn sort_order_for_summary_including_root(
         return SortOrder::Downloaded(latest_dl);
     }
 
-    if let Some(latest_ul) = summary
-        .completed_uploads
-        .values()
-        .map(|u| u.start)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Uploaded(latest_ul);
+    if !summary.completed_uploads.is_empty() {
+        if let Some(latest_ul) = summary
+            .completed_uploads
+            .values()
+            .map(|u| u.start)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            return SortOrder::Uploaded(latest_ul);
+        }
     }
 
     SortOrder::Unknown
@@ -342,6 +356,23 @@ pub fn sort_deps_of_set(state: &mut NomState, touched: &BTreeSet<DerivationId>) 
     for &drv_id in touched {
         let num_inputs = state.derivation_infos[drv_id.0].input_derivations.len();
         if num_inputs <= 1 {
+            continue;
+        }
+
+        if num_inputs == 2 {
+            let k0 = calculate_sort_key(
+                state,
+                state.derivation_infos[drv_id.0].input_derivations[0].derivation,
+            );
+            let k1 = calculate_sort_key(
+                state,
+                state.derivation_infos[drv_id.0].input_derivations[1].derivation,
+            );
+            if k0 > k1 {
+                state.derivation_infos[drv_id.0]
+                    .input_derivations
+                    .swap(0, 1);
+            }
             continue;
         }
 

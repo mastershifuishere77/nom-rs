@@ -15,7 +15,7 @@
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "nom-rs";
           version = "0.0.1";
-          src = ./.;
+          src = pkgs.lib.cleanSource ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
@@ -42,6 +42,45 @@
 
         packages.nom-rs = packages.default;
         packages.nom = packages.default;
+
+        packages.bench-stream-gen = pkgs.runCommand "bench-stream-gen" {
+          nativeBuildInputs = [ pkgs.rustc pkgs.stdenv.cc ];
+        } ''
+          mkdir -p "$out/bin"
+          rustc -O ${./benches/generate_stream.rs} -o "$out/bin/bench-stream-gen"
+        '';
+
+        packages.bench = pkgs.writeShellApplication {
+          name = "nom-bench";
+          runtimeInputs = [
+            pkgs.hyperfine
+            pkgs.time
+            pkgs.gawk
+            pkgs.coreutils
+            pkgs.bash
+          ];
+          text =
+            let
+              nom-rust = packages.default.overrideAttrs (_: { doCheck = false; });
+            in
+            ''
+              export NOM_RUST_BIN="${nom-rust}/bin/nom"
+              export NOM_HASKELL_BIN="${pkgs.nix-output-monitor}/bin/nom"
+              export NOM_GEN_BIN="${packages.bench-stream-gen}/bin/bench-stream-gen"
+              export NOM_TEST_DIR="${./test}"
+              export REPO_ROOT="''${REPO_ROOT:-$PWD}"
+              exec bash "${./benches/bench.sh}" "$@"
+            '';
+        };
+
+        apps.default = flake-utils.lib.mkApp {
+          drv = packages.default;
+          name = "nom";
+        };
+
+        apps.bench = flake-utils.lib.mkApp {
+          drv = packages.bench;
+        };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

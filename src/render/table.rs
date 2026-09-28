@@ -11,11 +11,18 @@ pub const GREY: &str = "\x1b[90m";
 
 #[inline(always)]
 fn is_printable_ascii_8(chunk: &[u8]) -> bool {
-    let mut ok = true;
-    for &b in chunk {
-        ok &= (0x20..=0x7e).contains(&b);
+    if chunk.len() < 8 {
+        return false;
     }
-    ok
+    let v = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+    let below = v.wrapping_sub(0x2020_2020_2020_2020);
+    let above = 0x7e7e_7e7e_7e7e_7e7e_u64.wrapping_sub(v);
+    ((below | above) & 0x8080_8080_8080_8080) == 0
+}
+
+#[inline(always)]
+fn is_printable_ascii_16(chunk: &[u8]) -> bool {
+    is_printable_ascii_8(chunk) && is_printable_ascii_8(&chunk[8..])
 }
 
 pub fn display_width(s: &str) -> usize {
@@ -24,15 +31,24 @@ pub fn display_width(s: &str) -> usize {
 
     // Fast-path: if string has no escape codes and all characters are printable ASCII,
     // each byte has width 1 and the total display width is exactly len.
-    if !bytes.contains(&b'\x1b') {
+    if memchr::memchr(b'\x1b', bytes).is_none() {
         let mut i = 0;
         let mut all_printable = true;
-        while i + 8 <= len {
-            if !is_printable_ascii_8(&bytes[i..i + 8]) {
+        while i + 16 <= len {
+            if !is_printable_ascii_16(&bytes[i..i + 16]) {
                 all_printable = false;
                 break;
             }
-            i += 8;
+            i += 16;
+        }
+        if all_printable {
+            while i + 8 <= len {
+                if !is_printable_ascii_8(&bytes[i..i + 8]) {
+                    all_printable = false;
+                    break;
+                }
+                i += 8;
+            }
         }
         if all_printable {
             while i < len {
@@ -87,7 +103,7 @@ pub fn display_width(s: &str) -> usize {
 pub fn truncate_display(s: &str, max_width: usize) -> String {
     // Fast path: if string contains no ANSI escapes and is pure ASCII fitting within max_width,
     // its display width is simply its length and no truncation or formatting is needed.
-    if !s.as_bytes().contains(&b'\x1b') && s.len() <= max_width && s.is_ascii() {
+    if s.len() <= max_width && memchr::memchr(b'\x1b', s.as_bytes()).is_none() && s.is_ascii() {
         return s.to_string();
     }
 
@@ -129,9 +145,52 @@ pub fn truncate_display(s: &str, max_width: usize) -> String {
     out
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntryCodes {
+    arr: [&'static str; 3],
+    len: u8,
+}
+
+impl EntryCodes {
+    pub const fn new() -> Self {
+        Self {
+            arr: ["", "", ""],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, s: &'static str) {
+        if (self.len as usize) < self.arr.len() {
+            self.arr[self.len as usize] = s;
+            self.len += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn contains(&self, s: &&str) -> bool {
+        self.as_slice().contains(s)
+    }
+
+    pub fn as_slice(&self) -> &[&'static str] {
+        &self.arr[..self.len as usize]
+    }
+}
+
+impl<'a> IntoIterator for &'a EntryCodes {
+    type Item = &'a &'static str;
+    type IntoIter = std::slice::Iter<'a, &'static str>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Entry {
-    pub codes: Vec<&'static str>,
+    pub codes: EntryCodes,
     pub lcontent: String,
     pub rcontent: String,
     pub width: usize,
@@ -144,7 +203,7 @@ impl Entry {
         let rcontent = t.into();
         let rw = display_width(&rcontent);
         Self {
-            codes: Vec::new(),
+            codes: EntryCodes::new(),
             lcontent: String::new(),
             rcontent,
             width: 1,
@@ -157,7 +216,7 @@ impl Entry {
         let lcontent = t.into();
         let lw = display_width(&lcontent);
         Self {
-            codes: Vec::new(),
+            codes: EntryCodes::new(),
             lcontent,
             rcontent: String::new(),
             width: 1,
@@ -223,8 +282,8 @@ pub fn markup(style_fn: impl Fn(Entry) -> Entry, text: &str) -> String {
     render_entry(&entry, entry.entry_width())
 }
 
-fn render_entry(entry: &Entry, col_width: usize) -> String {
-    let mut out = String::new();
+#[inline]
+pub fn render_entry_to(entry: &Entry, col_width: usize, out: &mut String) {
     for code in &entry.codes {
         out.push_str(code);
     }
@@ -237,6 +296,11 @@ fn render_entry(entry: &Entry, col_width: usize) -> String {
     if !entry.codes.is_empty() {
         out.push_str(RESET);
     }
+}
+
+pub fn render_entry(entry: &Entry, col_width: usize) -> String {
+    let mut out = String::with_capacity(col_width + 16);
+    render_entry_to(entry, col_width, &mut out);
     out
 }
 
@@ -299,9 +363,9 @@ pub fn print_aligned_table(rows: &[Vec<Entry>], sep: &str) -> Vec<String> {
         }
     }
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut row_str = String::new();
+        let mut row_str = String::with_capacity(128);
         let mut col_idx = 0;
 
         for (i, entry) in row.iter().enumerate() {
@@ -321,7 +385,7 @@ pub fn print_aligned_table(rows: &[Vec<Entry>], sep: &str) -> Vec<String> {
                 .sum::<usize>()
                 + sep_w * (entry.width.saturating_sub(1));
 
-            row_str.push_str(&render_entry(entry, span_width));
+            render_entry_to(entry, span_width, &mut row_str);
             col_idx += entry.width;
         }
 
@@ -339,7 +403,8 @@ pub fn prepend_lines(top: &str, mid: &str, bot: &str, rows: &[String]) -> String
         return format!("{}{}", top, rows[0]);
     }
 
-    let mut out = String::new();
+    let total_len: usize = rows.iter().map(|r| r.len() + mid.len() + 1).sum();
+    let mut out = String::with_capacity(total_len);
     for (i, row) in rows.iter().enumerate() {
         if i == 0 {
             out.push_str(top);
