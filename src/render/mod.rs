@@ -8,13 +8,14 @@ use crate::render::table::{
     GREY, MAGENTA, RED, RESET, YELLOW,
 };
 use crate::render::tree::{show_forest, TreeNode};
-use crate::sorting::calculate_sort_key;
+use crate::sorting::{calculate_sort_key, SortKey};
 use crate::state::{
     BuildStatus, DependencySummary, DerivationId, DerivationInfo, FailType, Host, NomState,
     ProgressState, TransferInfo,
 };
 use chrono::Local;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
 use terminal_size::{terminal_size, Height, Width};
 
 pub const VERTICAL: &str = "┃";
@@ -32,10 +33,20 @@ pub const WARNING: &str = "⚠";
 pub const AVERAGE: &str = "∅";
 pub const BIGSUM: &str = "∑";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HostSort {
+    #[default]
+    None,
+    DownloadSize,
+    Builds,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Config {
     pub silent: bool,
     pub piping: bool,
+    pub host_sort: HostSort,
+    pub host_cap: Option<usize>,
 }
 
 pub fn format_duration(diff: f64) -> String {
@@ -116,7 +127,7 @@ pub fn render_state_to_text(state: &NomState, config: Config, now: f64) -> Strin
 
     // 4. Summary table section
     if !state.full_summary.is_empty() || !sections.is_empty() {
-        sections.push(render_summary_table(state, now));
+        sections.push(render_summary_table(state, config, now));
     }
 
     if sections.is_empty() {
@@ -235,12 +246,21 @@ fn render_traces(traces: &[String], max_height: usize) -> String {
 
 fn render_builds(state: &NomState, _max_width: usize, max_height: usize, now: f64) -> String {
     let host_abbrevs = compute_host_abbrevs(state);
-    let forest = build_display_forest(state, &host_abbrevs, max_height, now);
+    let derivations_to_show = select_derivations_to_show(state, max_height);
+    let mut seen_build = FxHashSet::default();
+    let drv_forest =
+        go_build_forest(state, &state.forest_roots, &derivations_to_show, &mut seen_build);
+
+    let forest: Vec<TreeNode<Option<f64>>> = drv_forest
+        .iter()
+        .map(|node| convert_tree(state, node, true, &host_abbrevs, now))
+        .collect();
+
     let rows = show_forest(&forest);
 
     let num_raw_roots = state.forest_roots.len();
     let num_roots = forest.len();
-    let graph_title = format!("{}{}{}Dependency Graph{}", RESET, BOLD, BLUE, RESET);
+    let graph_title = format!("{}Dependency Graph{}", BOLD, RESET);
     let header_inner = if num_raw_roots <= 1 {
         graph_title
     } else if num_raw_roots == num_roots {
@@ -267,31 +287,111 @@ fn render_builds(state: &NomState, _max_width: usize, max_height: usize, now: f6
     )
 }
 
-fn build_display_forest(
-    state: &NomState,
-    host_abbrevs: &FxHashMap<String, String>,
-    max_height: usize,
-    now: f64,
-) -> Vec<TreeNode<Option<f64>>> {
-    let derivations_to_show = select_derivations_to_show(state, max_height);
-    let mut seen = FxHashSet::default();
-    let mut result = Vec::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeLocation {
+    Root,
+    Twig,
+    Leaf,
+}
 
-    for &root_id in &state.forest_roots {
-        if let Some(node) = build_tree_node(
-            state,
-            root_id,
-            &derivations_to_show,
-            &mut seen,
-            host_abbrevs,
-            true,
-            now,
-        ) {
-            result.push(node);
+struct DrvNode {
+    drv_id: DerivationId,
+    children: Vec<DrvNode>,
+}
+
+fn go_derivations_to_show(
+    state: &NomState,
+    this_drv: DerivationId,
+    limits_height: usize,
+    seen_ids: &mut FxHashSet<DerivationId>,
+    sorted_set: &mut BTreeSet<(bool, SortKey, DerivationId)>,
+) {
+    if limits_height == 0 {
+        return;
+    }
+    if state.is_summary_including_root_empty(this_drv) {
+        return;
+    }
+    if seen_ids.contains(&this_drv) {
+        return;
+    }
+
+    let sort_key = calculate_sort_key(state, this_drv);
+    let drv = state.get_derivation(this_drv);
+
+    let mut may_hide = true;
+
+    match &drv.build_status {
+        BuildStatus::Building(_) | BuildStatus::Failed(_)
+            if !seen_ids.contains(&this_drv) => {
+                may_hide = false;
+            }
+        _ => {}
+    }
+
+    if may_hide {
+        for &failed_id in drv.dependency_summary.failed_builds.keys() {
+            if !seen_ids.contains(&failed_id) {
+                may_hide = false;
+                break;
+            }
         }
     }
 
-    result
+    if may_hide {
+        for &running_id in drv.dependency_summary.running_builds.keys() {
+            if !seen_ids.contains(&running_id) {
+                may_hide = false;
+                break;
+            }
+        }
+    }
+
+    if may_hide {
+        for &path_id in drv
+            .dependency_summary
+            .running_downloads
+            .keys()
+            .chain(drv.dependency_summary.running_uploads.keys())
+        {
+            if path_id.0 < state.store_path_infos.len() {
+                let sp_info = &state.store_path_infos[path_id.0];
+                if let Some(prod_id) = sp_info.producer {
+                    if !seen_ids.contains(&prod_id) {
+                        may_hide = false;
+                        break;
+                    }
+                }
+                for &input_id in &sp_info.input_for {
+                    if !seen_ids.contains(&input_id) {
+                        may_hide = false;
+                        break;
+                    }
+                }
+                if !may_hide {
+                    break;
+                }
+            }
+        }
+    }
+
+    let can_fit = !may_hide
+        || sorted_set.len() < limits_height
+        || sorted_set
+            .iter()
+            .nth(limits_height.saturating_sub(1))
+            .is_some_and(|elem| sort_key < elem.1);
+
+    if !can_fit {
+        return;
+    }
+
+    seen_ids.insert(this_drv);
+    sorted_set.insert((may_hide, sort_key, this_drv));
+
+    for input in &drv.input_derivations {
+        go_derivations_to_show(state, input.derivation, limits_height, seen_ids, sorted_set);
+    }
 }
 
 pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> FxHashSet<DerivationId> {
@@ -299,225 +399,99 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> FxHash
         return FxHashSet::default();
     }
 
-    // 1. Identify all truly active nodes:
-    // - Derivations currently building (BuildStatus::Building)
-    // - Derivations that failed (BuildStatus::Failed)
-    // - Derivations with running downloads or uploads on their outputs
-    // - Derivations associated with running downloads/uploads from state.full_summary
-    let mut active_nodes: FxHashSet<DerivationId> = FxHashSet::default();
+    let mut seen_ids = FxHashSet::default();
+    let mut sorted_set = BTreeSet::new();
 
-    for &drv_id in state.full_summary.failed_builds.keys() {
-        active_nodes.insert(drv_id);
-    }
-    for &drv_id in state.full_summary.running_builds.keys() {
-        active_nodes.insert(drv_id);
-    }
-    for &path_id in state
-        .full_summary
-        .running_downloads
-        .keys()
-        .chain(state.full_summary.running_uploads.keys())
-    {
-        if path_id.0 < state.store_path_infos.len() {
-            let sp_info = &state.store_path_infos[path_id.0];
-            if let Some(drv_id) = sp_info.producer {
-                active_nodes.insert(drv_id);
-            }
-        }
-    }
-
-    if active_nodes.is_empty() {
-        for (idx, drv) in state.derivation_infos.iter().enumerate() {
-            if matches!(
-                drv.build_status,
-                BuildStatus::Building(_) | BuildStatus::Failed(_)
-            ) {
-                active_nodes.insert(DerivationId(idx));
-            }
-        }
-    }
-
-    // 2. Identify all nodes that have active descendants (including the active nodes themselves)
-    // and their entire ancestor paths up to roots using a unified multi-source BFS.
-    let mut active_path_nodes: FxHashSet<DerivationId> = active_nodes.clone();
-    let mut has_active_descendants: FxHashSet<DerivationId> = FxHashSet::default();
-    let mut parent_queue: Vec<DerivationId> = active_nodes.iter().copied().collect();
-
-    while let Some(p) = parent_queue.pop() {
-        let drv = state.get_derivation(p);
-        for &parent_id in &drv.derivation_parents {
-            let parent_drv = state.get_derivation(parent_id);
-            if !matches!(parent_drv.build_status, BuildStatus::Unknown)
-                || !state.is_summary_including_root_empty(parent_id)
-            {
-                has_active_descendants.insert(parent_id);
-                if active_path_nodes.insert(parent_id) {
-                    parent_queue.push(parent_id);
-                }
-            }
-        }
-    }
-
-    // Always include forest roots with non-empty summaries
-    let mut result = FxHashSet::default();
     for &root_id in &state.forest_roots {
-        if !state.is_summary_including_root_empty(root_id) {
-            result.insert(root_id);
-        }
+        go_derivations_to_show(state, root_id, max_height, &mut seen_ids, &mut sorted_set);
     }
 
-    if !active_nodes.is_empty() {
-        // Active builds / transfers are happening!
-        // All active path nodes (ancestors + active nodes) MUST be shown.
-        result.extend(active_path_nodes.iter().copied());
-
-        let mut budget = max_height.saturating_sub(result.len());
-        if budget > 0 {
-            // For nodes that have active descendants, allow their immediate children
-            // as collapsed leaves (sorted by sort_key) up to budget.
-            // But NEVER recurse into children of an inactive sibling!
-            let mut seen_candidates = FxHashSet::default();
-            let mut immediate_candidates: Vec<DerivationId> = Vec::new();
-
-            for &parent_id in has_active_descendants.iter().chain(&state.forest_roots) {
-                let drv = state.get_derivation(parent_id);
-                for input in &drv.input_derivations {
-                    if !result.contains(&input.derivation)
-                        && seen_candidates.insert(input.derivation)
-                    {
-                        immediate_candidates.push(input.derivation);
-                    }
-                }
-            }
-
-            // Sort unique immediate children by calculate_sort_key:
-            // Planned downloads (↓ ⏸) and planned builds (⏸) have higher priority than completed/unknown!
-            immediate_candidates
-                .sort_by_cached_key(|&child_id| calculate_sort_key(state, child_id));
-
-            for child_id in immediate_candidates {
-                if budget == 0 {
-                    break;
-                }
-                if !state.is_summary_including_root_empty(child_id) {
-                    result.insert(child_id);
-                    budget -= 1;
-                }
-            }
-        }
-    } else {
-        // No active nodes anywhere (planning / evaluation / idle / finished).
-        // Traverse level-by-level (BFS) from roots up to max_height, so we keep
-        // the tree shallow and connected, without expanding deep 7-level chains.
-        let mut queue: std::collections::VecDeque<DerivationId> =
-            state.forest_roots.iter().copied().collect();
-        let mut visited = result.clone();
-
-        while let Some(parent_id) = queue.pop_front() {
-            if result.len() >= max_height {
-                break;
-            }
-            let drv = state.get_derivation(parent_id);
-            let mut children: Vec<DerivationId> = drv
-                .input_derivations
-                .iter()
-                .map(|i| i.derivation)
-                .filter(|c| !visited.contains(c))
-                .collect();
-            children.sort_by_cached_key(|&c| calculate_sort_key(state, c));
-            children.dedup();
-
-            for child_id in children {
-                if result.len() >= max_height {
-                    break;
-                }
-                visited.insert(child_id);
-                if !state.is_summary_including_root_empty(child_id) {
-                    result.insert(child_id);
-                    queue.push_back(child_id);
-                }
-            }
-        }
-    }
-
-    result
+    sorted_set
+        .iter()
+        .enumerate()
+        .take_while(|&(index, &(can_be_hidden, _, _))| !can_be_hidden || index < max_height)
+        .map(|(_, &(_, _, drv_id))| drv_id)
+        .collect()
 }
 
-fn build_tree_node(
+fn go_build_forest(
     state: &NomState,
-    drv_id: DerivationId,
+    drvs: &[DerivationId],
     derivations_to_show: &FxHashSet<DerivationId>,
-    seen: &mut FxHashSet<DerivationId>,
-    host_abbrevs: &FxHashMap<String, String>,
-    is_root: bool,
-    now: f64,
-) -> Option<TreeNode<Option<f64>>> {
-    if seen.contains(&drv_id) || !derivations_to_show.contains(&drv_id) {
-        return None;
-    }
-    seen.insert(drv_id);
-
-    let drv = state.get_derivation(drv_id);
-    let mut children = Vec::new();
-    for input in &drv.input_derivations {
-        if let Some(child_node) = build_tree_node(
-            state,
-            input.derivation,
-            derivations_to_show,
-            seen,
-            host_abbrevs,
-            false,
-            now,
-        ) {
-            children.push(child_node);
+    seen_ids: &mut FxHashSet<DerivationId>,
+) -> Vec<DrvNode> {
+    let mut forest = Vec::new();
+    for &this_drv in drvs {
+        if !seen_ids.contains(&this_drv) && derivations_to_show.contains(&this_drv) {
+            seen_ids.insert(this_drv);
+            let drv = state.get_derivation(this_drv);
+            let child_ids: Vec<DerivationId> =
+                drv.input_derivations.iter().map(|i| i.derivation).collect();
+            let subforest = go_build_forest(state, &child_ids, derivations_to_show, seen_ids);
+            forest.push(DrvNode {
+                drv_id: this_drv,
+                children: subforest,
+            });
         }
     }
+    forest
+}
 
-    let is_leaf = children.is_empty();
+fn convert_tree(
+    state: &NomState,
+    node: &DrvNode,
+    top: bool,
+    host_abbrevs: &FxHashMap<String, String>,
+    now: f64,
+) -> TreeNode<Option<f64>> {
+    let loc = if node.children.is_empty() {
+        TreeLocation::Leaf
+    } else if top {
+        TreeLocation::Root
+    } else {
+        TreeLocation::Twig
+    };
 
-    // Check if this node is an inert pre-cached node:
-    // If it's a leaf, has BuildStatus::Unknown, and has NO running/completed/planned transfers on its outputs,
-    // it was never built/downloaded in this session and has no active descendants.
-    let dep_sum = &drv.dependency_summary;
-    let summary_has_transfers = !dep_sum.running_downloads.is_empty()
-        || !dep_sum.running_uploads.is_empty()
-        || !dep_sum.completed_downloads.is_empty()
-        || !dep_sum.completed_uploads.is_empty()
-        || !dep_sum.planned_downloads.is_empty();
+    let drv = state.get_derivation(node.drv_id);
+    let (label, progress) = format_derivation_node(state, drv, loc, host_abbrevs, now);
 
-    let has_transfers = summary_has_transfers
-        && drv.outputs.values().any(|&path_id| {
-            dep_sum.running_downloads.contains_key(&path_id)
-                || dep_sum.running_uploads.contains_key(&path_id)
-                || dep_sum.completed_downloads.contains_key(&path_id)
-                || dep_sum.completed_uploads.contains_key(&path_id)
-                || dep_sum.planned_downloads.contains(path_id.0 as u32)
-                || !state.get_store_path(path_id).states.is_empty()
-        });
-    if matches!(drv.build_status, BuildStatus::Unknown)
-        && !has_transfers
-        && (is_leaf || state.is_summary_including_root_empty(drv_id))
-    {
-        return None;
-    }
+    let children = node
+        .children
+        .iter()
+        .map(|c| convert_tree(state, c, false, host_abbrevs, now))
+        .collect();
 
-    let (label, progress) = format_derivation_row(state, drv, is_root, is_leaf, host_abbrevs, now);
-
-    Some(TreeNode {
+    TreeNode {
         label,
         extra: progress,
         children,
-    })
+    }
+}
+
+fn format_derivation_node(
+    state: &NomState,
+    drv: &DerivationInfo,
+    loc: TreeLocation,
+    host_abbrevs: &FxHashMap<String, String>,
+    now: f64,
+) -> (String, Option<f64>) {
+    let (planned, row_str, progress_val) = format_derivation_row(state, drv, host_abbrevs, now);
+    let summary = format_dependency_summary(&drv.dependency_summary);
+    let display_summary = loc == TreeLocation::Leaf && planned && !summary.is_empty();
+    let label = if display_summary {
+        format!("{}{} waiting for {}{}", row_str, GREY, summary, RESET)
+    } else {
+        row_str
+    };
+    (label, progress_val)
 }
 
 fn format_derivation_row(
     state: &NomState,
     drv: &DerivationInfo,
-    _is_root: bool,
-    is_leaf: bool,
     host_abbrevs: &FxHashMap<String, String>,
     now: f64,
-) -> (String, Option<f64>) {
+) -> (bool, String, Option<f64>) {
     let drv_name = format_differing_platform(state, drv);
     let mut progress_val = None;
 
@@ -819,21 +793,9 @@ fn format_derivation_row(
     };
 
     let is_planned = matches!(drv.build_status, BuildStatus::Planned)
-        || (matches!(drv.build_status, BuildStatus::Unknown)
-            && (is_planned_download || !drv.dependency_summary.is_empty()));
+        || (matches!(drv.build_status, BuildStatus::Unknown) && is_planned_download);
 
-    let summary_str = if is_leaf && is_planned {
-        let s = format_dependency_summary(&drv.dependency_summary);
-        if !s.is_empty() {
-            format!(" {} waiting for {}{}", GREY, s, RESET)
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    (format!("{}{}", row_str, summary_str), progress_val)
+    (is_planned, row_str, progress_val)
 }
 
 fn compute_transfer_progress<T>(
@@ -974,7 +936,7 @@ fn format_dependency_summary(s: &DependencySummary) -> String {
     parts.join(" ")
 }
 
-fn render_summary_table(state: &NomState, now: f64) -> String {
+fn render_summary_table(state: &NomState, config: Config, now: f64) -> String {
     let s = &state.full_summary;
     let num_running_builds = s.running_builds.len();
     let num_completed_builds = s.completed_builds.len();
@@ -1009,6 +971,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
         host: &'a Host,
         rb: usize,
         cb: usize,
+        pb: usize,
         rd: usize,
         cd: usize,
         ru: usize,
@@ -1025,6 +988,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
             host: &LOCALHOST,
             rb: 0,
             cb: 0,
+            pb: num_planned_builds,
             rd: 0,
             cd: 0,
             ru: 0,
@@ -1051,6 +1015,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &cp.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1070,6 +1035,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &b.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1085,6 +1051,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &b.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1110,6 +1077,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &cp.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1130,6 +1098,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &b.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1145,6 +1114,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host: &b.host,
                     rb: 0,
                     cb: 0,
+                    pb: 0,
                     rd: 0,
                     cd: 0,
                     ru: 0,
@@ -1162,6 +1132,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 host: &d.host,
                 rb: 0,
                 cb: 0,
+                pb: 0,
                 rd: 0,
                 cd: 0,
                 ru: 0,
@@ -1192,6 +1163,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 host: &d.host,
                 rb: 0,
                 cb: 0,
+                pb: 0,
                 rd: 0,
                 cd: 0,
                 ru: 0,
@@ -1223,6 +1195,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 host: &u.host,
                 rb: 0,
                 cb: 0,
+                pb: 0,
                 rd: 0,
                 cd: 0,
                 ru: 0,
@@ -1239,6 +1212,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 host: &u.host,
                 rb: 0,
                 cb: 0,
+                pb: 0,
                 rd: 0,
                 cd: 0,
                 ru: 0,
@@ -1249,7 +1223,25 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
             .cu += 1;
     }
 
-    let show_hosts = host_stats.len() > 1;
+    let is_active_host = |s: &HostStats| {
+        s.rb > 0
+            || s.cb > 0
+            || s.pb > 0
+            || s.rd > 0
+            || s.cd > 0
+            || s.ru > 0
+            || s.cu > 0
+            || s.host_done > 0
+            || s.host_expected > 0
+    };
+
+    let active_keys: Vec<&str> = host_stats
+        .iter()
+        .filter(|(_, s)| is_active_host(s))
+        .map(|(k, _)| *k)
+        .collect();
+
+    let show_hosts = active_keys.len() > 1;
 
     let mut header_row = Vec::new();
     if show_builds {
@@ -1272,19 +1264,177 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
 
     // Host rows if show_hosts
     if show_hosts {
-        let mut sorted_keys: Vec<&str> = host_stats.keys().copied().collect();
-        sorted_keys.sort_by(|a, b| {
-            if *a == "localhost" {
-                return std::cmp::Ordering::Less;
+        let localhost_active = active_keys.contains(&"localhost");
+        let mut other_keys: Vec<&str> = active_keys
+            .into_iter()
+            .filter(|&k| k != "localhost")
+            .collect();
+
+        match config.host_sort {
+            HostSort::DownloadSize => {
+                other_keys.sort_by(|&a, &b| {
+                    let sa = &host_stats[a];
+                    let sb = &host_stats[b];
+                    let size_a = sa.host_expected.max(sa.host_done);
+                    let size_b = sb.host_expected.max(sb.host_done);
+                    let builds_a = sa.rb + sa.cb + sa.pb;
+                    let builds_b = sb.rb + sb.cb + sb.pb;
+                    size_a
+                        .cmp(&size_b)
+                        .then_with(|| builds_a.cmp(&builds_b))
+                        .then_with(|| a.cmp(b))
+                });
             }
-            if *b == "localhost" {
-                return std::cmp::Ordering::Greater;
+            HostSort::Builds => {
+                other_keys.sort_by(|&a, &b| {
+                    let sa = &host_stats[a];
+                    let sb = &host_stats[b];
+                    let builds_a = sa.rb + sa.cb + sa.pb;
+                    let builds_b = sb.rb + sb.cb + sb.pb;
+                    let size_a = sa.host_expected.max(sa.host_done);
+                    let size_b = sb.host_expected.max(sb.host_done);
+                    builds_a
+                        .cmp(&builds_b)
+                        .then_with(|| size_a.cmp(&size_b))
+                        .then_with(|| a.cmp(b))
+                });
             }
-            a.split('.').rev().cmp(b.split('.').rev())
-        });
-        for h in sorted_keys {
-            let stats = &host_stats[h];
-            let host_display = stats.host.format_with_proto_context();
+            HostSort::None => {
+                if config.host_cap.is_some() {
+                    other_keys.sort_by(|&a, &b| {
+                        let sa = &host_stats[a];
+                        let sb = &host_stats[b];
+                        let act_a = (sa.host_expected.max(sa.host_done), sa.rb + sa.cb + sa.pb);
+                        let act_b = (sb.host_expected.max(sb.host_done), sb.rb + sb.cb + sb.pb);
+                        act_a.cmp(&act_b).then_with(|| a.cmp(b))
+                    });
+                } else {
+                    other_keys.sort_by(|a, b| a.split('.').rev().cmp(b.split('.').rev()));
+                }
+            }
+        }
+
+        struct DisplayHostStats {
+            host_display: String,
+            rb: usize,
+            cb: usize,
+            pb: usize,
+            rd: usize,
+            cd: usize,
+            ru: usize,
+            cu: usize,
+            host_done: usize,
+            host_expected: usize,
+        }
+
+        let total_other = other_keys.len();
+        let mut final_host_stats = Vec::new();
+
+        // 1. localhost is always pinned at the top (if active), non-sortable and never capped into "other"
+        if localhost_active {
+            let s = &host_stats["localhost"];
+            final_host_stats.push(DisplayHostStats {
+                host_display: s.host.format_with_proto_context(),
+                rb: s.rb,
+                cb: s.cb,
+                pb: s.pb,
+                rd: s.rd,
+                cd: s.cd,
+                ru: s.ru,
+                cu: s.cu,
+                host_done: s.host_done,
+                host_expected: s.host_expected,
+            });
+        }
+
+        // 2. Cap and sort other (remote/substituter) hosts
+        if let Some(cap) = config.host_cap {
+            if cap < total_other {
+                let num_capped = total_other - cap;
+                let capped_keys = &other_keys[..num_capped];
+                let display_keys = &other_keys[num_capped..];
+
+                let mut other = DisplayHostStats {
+                    host_display: "other".to_string(),
+                    rb: 0,
+                    cb: 0,
+                    pb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                };
+
+                for &k in capped_keys {
+                    let s = &host_stats[k];
+                    other.rb += s.rb;
+                    other.cb += s.cb;
+                    other.pb += s.pb;
+                    other.rd += s.rd;
+                    other.cd += s.cd;
+                    other.ru += s.ru;
+                    other.cu += s.cu;
+                    other.host_done += s.host_done;
+                    other.host_expected += s.host_expected;
+                }
+
+                // "other" appears below localhost
+                final_host_stats.push(other);
+
+                // Then the capped non-localhost hosts in ascending order (biggest at bottom)
+                for &k in display_keys {
+                    let s = &host_stats[k];
+                    final_host_stats.push(DisplayHostStats {
+                        host_display: s.host.format_with_proto_context(),
+                        rb: s.rb,
+                        cb: s.cb,
+                        pb: s.pb,
+                        rd: s.rd,
+                        cd: s.cd,
+                        ru: s.ru,
+                        cu: s.cu,
+                        host_done: s.host_done,
+                        host_expected: s.host_expected,
+                    });
+                }
+            } else {
+                for &k in &other_keys {
+                    let s = &host_stats[k];
+                    final_host_stats.push(DisplayHostStats {
+                        host_display: s.host.format_with_proto_context(),
+                        rb: s.rb,
+                        cb: s.cb,
+                        pb: s.pb,
+                        rd: s.rd,
+                        cd: s.cd,
+                        ru: s.ru,
+                        cu: s.cu,
+                        host_done: s.host_done,
+                        host_expected: s.host_expected,
+                    });
+                }
+            }
+        } else {
+            for &k in &other_keys {
+                let s = &host_stats[k];
+                final_host_stats.push(DisplayHostStats {
+                    host_display: s.host.format_with_proto_context(),
+                    rb: s.rb,
+                    cb: s.cb,
+                    pb: s.pb,
+                    rd: s.rd,
+                    cd: s.cd,
+                    ru: s.ru,
+                    cu: s.cu,
+                    host_done: s.host_done,
+                    host_expected: s.host_expected,
+                });
+            }
+        }
+
+        for stats in final_host_stats {
             let mut host_row = Vec::new();
             if show_builds {
                 if stats.rb > 0 {
@@ -1297,7 +1447,11 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 } else {
                     host_row.push(Entry::text(""));
                 }
-                host_row.push(Entry::text(""));
+                if stats.pb > 0 {
+                    host_row.push(non_zero_entry(TODO, stats.pb, |e| e.blue()));
+                } else {
+                    host_row.push(Entry::text(""));
+                }
             }
             if show_dl {
                 if stats.rd > 0 {
@@ -1311,13 +1465,14 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host_row.push(Entry::text(""));
                 }
                 host_row.push(Entry::text(""));
-                if stats.host_expected > 0 {
+                if stats.host_expected > 0 || stats.host_done > 0 {
+                    let expected = stats.host_expected.max(stats.host_done);
                     host_row.push(
                         Entry::text(format!(
                             "{} {}/{}",
                             DOWN,
                             print_bytes(stats.host_done),
-                            print_bytes(stats.host_expected)
+                            print_bytes(expected)
                         ))
                         .green(),
                     );
@@ -1337,7 +1492,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                     host_row.push(Entry::text(""));
                 }
             }
-            host_row.push(Entry::header(host_display).magenta());
+            host_row.push(Entry::header(stats.host_display).magenta());
             rows.push(host_row);
         }
     }
@@ -1408,10 +1563,24 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
                 dur,
                 RESET
             )
+        } else if !state.nix_traces.is_empty() {
+            format!(
+                "{}{}{}{} Finished {}with {} traces reported by nix{} at {} after {}{}",
+                BOLD,
+                YELLOW,
+                WARNING,
+                GREEN,
+                YELLOW,
+                state.nix_traces.len(),
+                GREEN,
+                local_time,
+                dur,
+                RESET
+            )
         } else {
             format!(
-                "{}{}{} Finished at {} after {}{}",
-                BOLD, GREEN, DONE, local_time, dur, RESET
+                "{}{}Finished at {} after {}{}",
+                BOLD, GREEN, local_time, dur, RESET
             )
         }
     } else {

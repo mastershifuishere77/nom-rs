@@ -394,6 +394,7 @@ fn test_stream_with_many_planned_derivations() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let state = monitor_stream(cursor, false, config);
 
@@ -668,7 +669,7 @@ fn test_inactive_deep_subtrees_pruning() {
         prev_id = id;
     }
 
-    let selected = select_derivations_to_show(&state, 20);
+    let selected = select_derivations_to_show(&state, 4);
 
     // Must contain active path
     assert!(selected.contains(&root_id), "Must contain root");
@@ -875,6 +876,7 @@ fn test_inert_unknown_derivations_pruned() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 15.0);
     assert!(rendered.contains("etc"), "Rendered tree must contain etc");
@@ -935,6 +937,7 @@ fn test_localhost_presence_and_order_before_builds() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 1.0);
 
@@ -1013,6 +1016,7 @@ fn test_compressed_download_size_preferred_over_unpacked() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 1.0);
 
@@ -1084,6 +1088,7 @@ fn test_single_substituter_does_not_display_from_abbrev() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 1.0);
 
@@ -1173,6 +1178,7 @@ fn test_multiple_substituters_display_from_abbrev() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 1.0);
 
@@ -1231,6 +1237,7 @@ fn test_waiting_unknown_derivation_renders_with_todo_symbol() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let rendered = render_state_to_text(&state, config, 1.0);
 
@@ -1260,6 +1267,7 @@ fn test_curl_progress_json_stream_end_to_end() {
     let config = Config {
         silent: false,
         piping: false,
+        ..Default::default()
     };
     let state = monitor_stream(Cursor::new(json_input), true, config);
 
@@ -1298,6 +1306,7 @@ fn test_curl_progress_retry_resets_size_and_updates_mirror() {
     let config = Config {
         silent: true,
         piping: false,
+        ..Default::default()
     };
     let state = monitor_stream(Cursor::new(json_input), true, config);
 
@@ -1324,6 +1333,7 @@ fn test_curl_progress_fallback_host_when_no_trying_line() {
     let config = Config {
         silent: true,
         piping: false,
+        ..Default::default()
     };
     let state = monitor_stream(Cursor::new(json_input), true, config);
 
@@ -1333,6 +1343,361 @@ fn test_curl_progress_fallback_host_when_no_trying_line() {
 
     let cp = drv_info.curl_progress.as_ref().expect("curl_progress must be present on derivation");
     assert_eq!(cp.host.hostname_only(), "curl");
+}
+
+#[test]
+fn test_host_sorting_by_download_size() {
+    use nix_output_monitor::parser::json::{Activity, ActivityProgress};
+    use nix_output_monitor::render::{render_state_to_text, Config, HostSort};
+    use nix_output_monitor::state::{ActivityStatus, NomState, TransferInfo};
+    use nix_output_monitor::types::{Host, StorePath};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    let make_dl = |state: &mut NomState, act_id: u64, host_url: &str, path_str: &str, size_bytes: usize| {
+        let sp = StorePath::parse(path_str).unwrap();
+        let sp_id = state.get_store_path_id(&sp);
+        let host = Host::parse(host_url);
+        state.activities.insert(
+            act_id,
+            ActivityStatus {
+                activity: Activity::CopyPath {
+                    path: sp.clone(),
+                    from: host.clone(),
+                    to: Host::Localhost,
+                },
+                phase: None,
+                progress: Some(ActivityProgress {
+                    done: size_bytes,
+                    expected: size_bytes,
+                    running: 0,
+                    failed: 0,
+                }),
+                file_transfer_progress: None,
+                curl_progress: None,
+                prefix: "".into(),
+            },
+        );
+        state.full_summary.completed_downloads.insert(
+            sp_id,
+            TransferInfo {
+                host,
+                start: 0.0,
+                activity_id: Some(act_id),
+                end: nix_output_monitor::state::CompletedEnd(Some(1.0)),
+            },
+        );
+    };
+
+    make_dl(&mut state, 1, "https://small.cache.org", "/nix/store/11111111111111111111111111111111-p1", 10 * 1024 * 1024);
+    make_dl(&mut state, 2, "https://large.cache.org", "/nix/store/22222222222222222222222222222222-p2", 500 * 1024 * 1024);
+    make_dl(&mut state, 3, "https://medium.cache.org", "/nix/store/33333333333333333333333333333333-p3", 50 * 1024 * 1024);
+
+    let config = Config {
+        silent: false,
+        piping: false,
+        host_sort: HostSort::DownloadSize,
+        host_cap: None,
+    };
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+
+    let pos_small = rendered.find("small.cache.org").expect("small.cache.org must be present");
+    let pos_med = rendered.find("medium.cache.org").expect("medium.cache.org must be present");
+    let pos_large = rendered.find("large.cache.org").expect("large.cache.org must be present");
+
+    // Biggest ones go to the bottom: small < medium < large
+    assert!(pos_small < pos_med, "small must appear before medium");
+    assert!(pos_med < pos_large, "medium must appear before large (biggest at bottom)");
+}
+
+#[test]
+fn test_host_sorting_by_builds() {
+    use nix_output_monitor::render::{render_state_to_text, Config, HostSort};
+    use nix_output_monitor::state::{BuildInfo, NomState};
+    use nix_output_monitor::types::{Derivation, Host};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    let add_build = |state: &mut NomState, host_name: &str, drv_str: &str| {
+        let drv = Derivation::parse(drv_str).unwrap();
+        let drv_id = state.get_derivation_id(&drv);
+        let host = Host::parse(host_name);
+        state.full_summary.completed_builds.insert(
+            drv_id,
+            BuildInfo {
+                start: 0.0,
+                host,
+                estimate: None,
+                activity_id: None,
+                end: 1.0,
+            },
+        );
+    };
+
+    // builder-small: 1 build
+    add_build(&mut state, "builder-small.org", "/nix/store/11111111111111111111111111111111-p1.drv");
+
+    // builder-medium: 3 builds
+    add_build(&mut state, "builder-medium.org", "/nix/store/22222222222222222222222222222222-p2.drv");
+    add_build(&mut state, "builder-medium.org", "/nix/store/33333333333333333333333333333333-p3.drv");
+    add_build(&mut state, "builder-medium.org", "/nix/store/44444444444444444444444444444444-p4.drv");
+
+    // builder-large: 5 builds
+    for i in 5..=9 {
+        add_build(&mut state, "builder-large.org", &format!("/nix/store/{:032x}-p{}.drv", i, i));
+    }
+
+    let config = Config {
+        silent: false,
+        piping: false,
+        host_sort: HostSort::Builds,
+        host_cap: None,
+    };
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+
+    let pos_small = rendered.find("builder-small.org").expect("builder-small.org must be present");
+    let pos_med = rendered.find("builder-medium.org").expect("builder-medium.org must be present");
+    let pos_large = rendered.find("builder-large.org").expect("builder-large.org must be present");
+
+    // Biggest ones go to the bottom: small (1) < medium (3) < large (5)
+    assert!(pos_small < pos_med, "small must appear before medium");
+    assert!(pos_med < pos_large, "medium must appear before large (biggest at bottom)");
+}
+
+#[test]
+fn test_host_capping_with_other() {
+    use nix_output_monitor::render::{render_state_to_text, Config, HostSort};
+    use nix_output_monitor::state::{BuildInfo, NomState};
+    use nix_output_monitor::types::{Derivation, Host};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    let add_build = |state: &mut NomState, host_name: &str, drv_str: &str| {
+        let drv = Derivation::parse(drv_str).unwrap();
+        let drv_id = state.get_derivation_id(&drv);
+        let host = Host::parse(host_name);
+        state.full_summary.completed_builds.insert(
+            drv_id,
+            BuildInfo {
+                start: 0.0,
+                host,
+                estimate: None,
+                activity_id: None,
+                end: 1.0,
+            },
+        );
+    };
+
+    add_build(&mut state, "node-1.org", "/nix/store/11111111111111111111111111111111-p1.drv");
+    add_build(&mut state, "node-2.org", "/nix/store/22222222222222222222222222222222-p2.drv");
+    add_build(&mut state, "node-3.org", "/nix/store/33333333333333333333333333333333-p3.drv");
+    for i in 10..15 {
+        add_build(&mut state, "node-big-1.org", &format!("/nix/store/{:032x}-p{}.drv", i, i));
+    }
+    for i in 20..30 {
+        add_build(&mut state, "node-big-2.org", &format!("/nix/store/{:032x}-p{}.drv", i, i));
+    }
+
+    // Cap to 2 hosts.
+    // Out of 6 total hosts (localhost, node-1, node-2, node-3, node-big-1, node-big-2),
+    // 2 largest must be shown (node-big-1 and node-big-2), and all others combined into "other".
+    let config = Config {
+        silent: false,
+        piping: false,
+        host_sort: HostSort::Builds,
+        host_cap: Some(2),
+    };
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+
+    // "other" must appear because total hosts (6) > cap (2)
+    assert!(rendered.contains("other"), "Must contain 'other' host row:\n{}", rendered);
+
+    // node-big-1 and node-big-2 must appear
+    assert!(rendered.contains("node-big-1.org"), "Must contain top host node-big-1.org");
+    assert!(rendered.contains("node-big-2.org"), "Must contain top host node-big-2.org");
+
+    // node-1, node-2, node-3 must NOT appear individually
+    assert!(!rendered.contains("node-1.org"), "Must NOT contain capped-out node-1.org");
+    assert!(!rendered.contains("node-2.org"), "Must NOT contain capped-out node-2.org");
+    assert!(!rendered.contains("node-3.org"), "Must NOT contain capped-out node-3.org");
+
+    // Order: "other" (top) -> node-big-1 -> node-big-2 (bottom)
+    let pos_other = rendered.find("other").unwrap();
+    let pos_b1 = rendered.find("node-big-1.org").unwrap();
+    let pos_b2 = rendered.find("node-big-2.org").unwrap();
+    assert!(pos_other < pos_b1, "other must appear before top hosts");
+    assert!(pos_b1 < pos_b2, "node-big-1 must appear before node-big-2 (biggest at bottom)");
+}
+
+#[test]
+fn test_host_capping_no_other_when_within_cap() {
+    use nix_output_monitor::render::{render_state_to_text, Config, HostSort};
+    use nix_output_monitor::state::{BuildInfo, NomState};
+    use nix_output_monitor::types::{Derivation, Host};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    let drv = Derivation::parse("/nix/store/11111111111111111111111111111111-p1.drv").unwrap();
+    let drv_id = state.get_derivation_id(&drv);
+    state.full_summary.completed_builds.insert(
+        drv_id,
+        BuildInfo {
+            start: 0.0,
+            host: Host::parse("builder.org"),
+            estimate: None,
+            activity_id: None,
+            end: 1.0,
+        },
+    );
+
+    let drv_local = Derivation::parse("/nix/store/00000000000000000000000000000000-local.drv").unwrap();
+    let drv_local_id = state.get_derivation_id(&drv_local);
+    state.full_summary.completed_builds.insert(
+        drv_local_id,
+        BuildInfo {
+            start: 0.0,
+            host: Host::Localhost,
+            estimate: None,
+            activity_id: None,
+            end: 1.0,
+        },
+    );
+
+    // Total hosts = 2 (localhost, builder.org). Cap = 5.
+    let config = Config {
+        silent: false,
+        piping: false,
+        host_sort: HostSort::Builds,
+        host_cap: Some(5),
+    };
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+
+    // "other" must NOT appear because 2 <= 5
+    assert!(!rendered.contains("other"), "Must NOT contain 'other' when within cap:\n{}", rendered);
+    assert!(rendered.contains("builder.org"), "Must contain builder.org");
+    assert!(rendered.contains("localhost"), "Must contain localhost");
+}
+
+#[test]
+fn test_localhost_never_capped_into_other() {
+    use nix_output_monitor::render::{render_state_to_text, Config, HostSort};
+    use nix_output_monitor::state::{BuildInfo, NomState};
+    use nix_output_monitor::types::{Derivation, Host};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    let add_build = |state: &mut NomState, host: Host, drv_str: &str| {
+        let drv = Derivation::parse(drv_str).unwrap();
+        let drv_id = state.get_derivation_id(&drv);
+        state.full_summary.completed_builds.insert(
+            drv_id,
+            BuildInfo {
+                start: 0.0,
+                host,
+                estimate: None,
+                activity_id: None,
+                end: 1.0,
+            },
+        );
+    };
+
+    // localhost gets 1 build (fewest)
+    add_build(&mut state, Host::Localhost, "/nix/store/00000000000000000000000000000000-local.drv");
+    // remote hosts get more builds
+    for i in 1..=5u32 {
+        add_build(
+            &mut state,
+            Host::parse(&format!("node-{}.org", i)),
+            &format!("/nix/store/{:032x}-p{}.drv", i, i),
+        );
+    }
+
+    // Cap to 2 — only 2 remote hosts shown, rest folded into "other".
+    // localhost must ALWAYS appear (never capped), even though it has the fewest builds.
+    let config = Config {
+        silent: false,
+        piping: false,
+        host_sort: HostSort::Builds,
+        host_cap: Some(2),
+    };
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+
+    assert!(rendered.contains("localhost"), "localhost must always appear, never capped into other:\n{}", rendered);
+    assert!(rendered.contains("other"), "other must appear when remote hosts exceed cap:\n{}", rendered);
+
+    // localhost must appear BEFORE "other"
+    let pos_localhost = rendered.find("localhost").unwrap();
+    let pos_other = rendered.find("other").unwrap();
+    assert!(pos_localhost < pos_other, "localhost must appear before other");
+}
+
+#[test]
+fn test_cli_parse_nom_options() {
+    use nix_output_monitor::cli::parse_nom_options;
+    use nix_output_monitor::render::HostSort;
+
+    let args = vec![
+        "--json".to_string(),
+        "--sort-hosts-by-size".to_string(),
+        "--cap-hosts".to_string(),
+        "5".to_string(),
+        "foo".to_string(),
+    ];
+    let (clean, sort, cap) = parse_nom_options(&args);
+    assert_eq!(clean, vec!["--json", "foo"]);
+    assert_eq!(sort, HostSort::DownloadSize);
+    assert_eq!(cap, Some(5));
+
+    let args2 = vec![
+        "--sort-hosts-by-builds".to_string(),
+        "--cap-hosts=3".to_string(),
+    ];
+    let (clean2, sort2, cap2) = parse_nom_options(&args2);
+    assert!(clean2.is_empty());
+    assert_eq!(sort2, HostSort::Builds);
+    assert_eq!(cap2, Some(3));
+}
+
+#[test]
+fn test_env_parse_nom_options() {
+    use nix_output_monitor::cli::parse_nom_options;
+    use nix_output_monitor::render::HostSort;
+
+    unsafe {
+        std::env::set_var("NOM_SORT_BY_BUILDS", "true");
+        std::env::set_var("NOM_HOST_CAP", "7");
+    }
+    let (clean, sort, cap) = parse_nom_options(&[]);
+    assert!(clean.is_empty());
+    assert_eq!(sort, HostSort::Builds);
+    assert_eq!(cap, Some(7));
+
+    unsafe {
+        std::env::remove_var("NOM_SORT_BY_BUILDS");
+        std::env::remove_var("NOM_HOST_CAP");
+        std::env::set_var("NOM_SORT_BY_SIZE", "1");
+        std::env::set_var("NOM_CAP_HOSTS", "4");
+    }
+    let (clean2, sort2, cap2) = parse_nom_options(&[]);
+    assert!(clean2.is_empty());
+    assert_eq!(sort2, HostSort::DownloadSize);
+    assert_eq!(cap2, Some(4));
+
+    unsafe {
+        std::env::remove_var("NOM_SORT_BY_SIZE");
+        std::env::remove_var("NOM_CAP_HOSTS");
+        std::env::remove_var("NOM_HOST_CAP");
+    }
 }
 
 

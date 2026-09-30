@@ -54,6 +54,7 @@ fn test_integration_standard_json() {
     let config = Config {
         silent: true,
         piping: true,
+        ..Default::default()
     };
 
     let state = monitor_stream(cursor, true, config);
@@ -88,6 +89,7 @@ fn test_integration_fail_json() {
     let config = Config {
         silent: true,
         piping: true,
+        ..Default::default()
     };
 
     let state = monitor_stream(cursor, true, config);
@@ -129,6 +131,7 @@ fn test_integration_fail_old_style() {
     let config = Config {
         silent: true,
         piping: true,
+        ..Default::default()
     };
 
     let state = monitor_stream(cursor, false, config);

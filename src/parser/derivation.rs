@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 #[derive(Clone, Debug, Default)]
 pub struct ParsedDerivation {
     pub outputs: FxHashMap<OutputName, StorePath>,
-    pub input_drvs: FxHashMap<Derivation, Vec<OutputName>>,
+    pub input_drvs: rustc_hash::FxHashMap<Derivation, Vec<OutputName>>,
     pub input_srcs: Vec<StorePath>,
     pub platform: String,
     pub pname: Option<String>,
@@ -190,7 +190,7 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
     lexer.expect(b',')?;
 
     // 2. inputDrvs: [ ("/nix/store/...drv", ["out", ...]), ... ]
-    let mut input_drvs = FxHashMap::default();
+    let mut input_drvs = rustc_hash::FxHashMap::default();
     lexer.expect(b'[')?;
     if lexer.peek() != Some(b']') {
         loop {

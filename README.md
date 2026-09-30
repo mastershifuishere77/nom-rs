@@ -153,6 +153,29 @@ nix build --log-format internal-json -v .#myPackage 2>&1 | nom --json
 nh os switch
 ```
 
+### Host Sorting & Capping (Summary Table)
+
+`nom-rs` supports sorting and capping the hosts displayed in the bottom summary table (disabled by default):
+
+#### Flags
+- `--sort-hosts-by-size` (or `--sort-hosts-by-download-size`): Sort hosts ascending by total to-be-downloaded size, placing the largest download hosts at the bottom.
+- `--sort-hosts-by-builds`: Sort hosts ascending by total summarized builds (paused, active, and finished), placing hosts with the most builds at the bottom.
+- `--cap-hosts <N>` (or `--max-hosts <N>`): Limit the display to the `N` largest hosts. When total hosts exceed `N`, all remaining smaller hosts are combined into an `"other"` host row at the top (displaying at most `N + 1` rows). `"other"` only appears if the number of hosts exceeds `N`.
+
+#### Environment Variables
+Useful when running through wrappers such as `nh`:
+```bash
+NOM_SORT_BY_SIZE=true nh os switch
+NOM_SORT_BY_BUILDS=true nh os switch
+NOM_HOST_CAP=5 nh os switch
+```
+
+Supported variables:
+- `NOM_SORT_BY_SIZE=true` / `NOM_SORT_BY_DOWNLOAD_SIZE=true`
+- `NOM_SORT_BY_BUILDS=true`
+- `NOM_HOST_SORT=size|builds`
+- `NOM_HOST_CAP=<N>` / `NOM_CAP_HOSTS=<N>`
+
 ## Building from Source
 
 ```bash

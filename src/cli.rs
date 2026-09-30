@@ -1,5 +1,5 @@
 use crate::engine::monitor_stream;
-use crate::render::Config;
+use crate::render::{Config, HostSort};
 use std::env;
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
@@ -29,9 +29,22 @@ pub const HELP_TEXT: &str = r#"nom-rs usages:
     Don't forget to redirect stderr, too. That's what the & does.
 
 Flags:
-  --version  Show version.
-  -h, --help Show this help.
-  --json     Parse input as nix internal-json
+  --version                       Show version.
+  -h, --help                      Show this help.
+  --json                          Parse input as nix internal-json
+  --sort-hosts-by-size            Sort hosts by total to-be-downloaded size (biggest at bottom)
+  --sort-hosts-by-download-size   Alias for --sort-hosts-by-size
+  --sort-hosts-by-builds          Sort hosts by total amount of builds (paused, active, finished)
+  --cap-hosts <N>                 Cap displayed hosts to N, combining all remaining into "other"
+  --max-hosts <N>                 Alias for --cap-hosts
+
+Environment Variables:
+  NOM_SORT_BY_SIZE=true           Sort hosts by total to-be-downloaded size
+  NOM_SORT_BY_DOWNLOAD_SIZE=true  Alias for NOM_SORT_BY_SIZE
+  NOM_SORT_BY_BUILDS=true         Sort hosts by total amount of builds
+  NOM_HOST_SORT=size|builds       Set host sorting mode
+  NOM_HOST_CAP=<N>                Cap displayed hosts to N
+  NOM_CAP_HOSTS=<N>               Alias for NOM_HOST_CAP
 
 Please see the readme for more details:
 https://github.com/mastershifuishere77/nom-rs
@@ -64,6 +77,71 @@ pub fn replace_command_with_exit(args: &[String]) -> Vec<String> {
     out
 }
 
+pub fn parse_nom_options(args: &[String]) -> (Vec<String>, HostSort, Option<usize>) {
+    let mut clean_args = Vec::new();
+    let mut host_sort = HostSort::None;
+    let mut host_cap = None;
+
+    let is_truthy = |s: &str| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+
+    if env::var("NOM_SORT_BY_BUILDS").map(|v| is_truthy(&v)).unwrap_or(false) {
+        host_sort = HostSort::Builds;
+    } else if env::var("NOM_SORT_BY_SIZE")
+        .or_else(|_| env::var("NOM_SORT_BY_DOWNLOAD_SIZE"))
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false)
+    {
+        host_sort = HostSort::DownloadSize;
+    } else if let Ok(val) = env::var("NOM_HOST_SORT") {
+        match val.to_lowercase().as_str() {
+            "size" | "download-size" | "download_size" => host_sort = HostSort::DownloadSize,
+            "builds" => host_sort = HostSort::Builds,
+            _ => {}
+        }
+    }
+    if let Ok(val) = env::var("NOM_HOST_CAP").or_else(|_| env::var("NOM_CAP_HOSTS")) {
+        if let Ok(n) = val.parse::<usize>() {
+            host_cap = Some(n);
+        }
+    }
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--sort-hosts-by-size" || arg == "--sort-hosts-by-download-size" {
+            host_sort = HostSort::DownloadSize;
+            i += 1;
+        } else if arg == "--sort-hosts-by-builds" {
+            host_sort = HostSort::Builds;
+            i += 1;
+        } else if arg == "--cap-hosts" || arg == "--max-hosts" {
+            if i + 1 < args.len() {
+                if let Ok(n) = args[i + 1].parse::<usize>() {
+                    host_cap = Some(n);
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if let Some(val) = arg.strip_prefix("--cap-hosts=") {
+            if let Ok(n) = val.parse::<usize>() {
+                host_cap = Some(n);
+            }
+            i += 1;
+        } else if let Some(val) = arg.strip_prefix("--max-hosts=") {
+            if let Ok(n) = val.parse::<usize>() {
+                host_cap = Some(n);
+            }
+            i += 1;
+        } else {
+            clean_args.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    (clean_args, host_sort, host_cap)
+}
+
 pub fn run_app() -> ExitCode {
     let prog_name = env::args()
         .next()
@@ -74,11 +152,20 @@ pub fn run_app() -> ExitCode {
         })
         .unwrap_or_else(|| "nom".to_string());
 
-    let args: Vec<String> = env::args().skip(1).collect();
+    let raw_args: Vec<String> = env::args().skip(1).collect();
 
     if env::var("NIX_GET_COMPLETIONS").is_ok() {
-        return handle_completions(&prog_name, &args);
+        return handle_completions(&prog_name, &raw_args);
     }
+
+    let (args, host_sort, host_cap) = parse_nom_options(&raw_args);
+
+    let base_config = Config {
+        silent: false,
+        piping: false,
+        host_sort,
+        host_cap,
+    };
 
     match (prog_name.as_str(), args.as_slice()) {
         (_, [arg]) if arg == "--version" => {
@@ -97,19 +184,13 @@ pub fn run_app() -> ExitCode {
             ExitCode::from(1)
         }
         ("nom-build", args) => {
-            let config = Config {
-                silent: false,
-                piping: false,
-            };
-            run_monitored_command("nix-build", &with_json(args), config)
+            run_monitored_command("nix-build", &with_json(args), base_config)
         }
         ("nom-shell", args) => {
             let mut check_args = with_json(args);
             check_args.extend_from_slice(&["--run".to_string(), "exit".to_string()]);
-            let check_config = Config {
-                silent: true,
-                piping: false,
-            };
+            let mut check_config = base_config;
+            check_config.silent = true;
             let code = run_monitored_command("nix-shell", &check_args, check_config);
             if code != ExitCode::SUCCESS {
                 return code;
@@ -126,11 +207,7 @@ pub fn run_app() -> ExitCode {
         ("nom", [sub, rest @ ..]) if sub == "build" => {
             let mut full_args = vec!["build".to_string()];
             full_args.extend(with_json(rest));
-            let config = Config {
-                silent: false,
-                piping: false,
-            };
-            run_monitored_command("nix", &full_args, config)
+            run_monitored_command("nix", &full_args, base_config)
         }
         ("nom", [sub, rest @ ..]) if sub == "copy" && rest.iter().any(|a| a == "--help") => {
             let mut cmd = Command::new("nix");
@@ -142,20 +219,14 @@ pub fn run_app() -> ExitCode {
         ("nom", [sub, rest @ ..]) if sub == "copy" => {
             let mut full_args = vec!["copy".to_string()];
             full_args.extend(with_json(rest));
-            let config = Config {
-                silent: false,
-                piping: false,
-            };
-            run_monitored_command("nix", &full_args, config)
+            run_monitored_command("nix", &full_args, base_config)
         }
         ("nom", [sub, rest @ ..]) if sub == "shell" => {
             let filtered = replace_command_with_exit(rest);
             let mut check_args = vec!["shell".to_string()];
             check_args.extend(with_json(&filtered));
-            let check_config = Config {
-                silent: true,
-                piping: false,
-            };
+            let mut check_config = base_config;
+            check_config.silent = true;
             let code = run_monitored_command("nix", &check_args, check_config);
             if code != ExitCode::SUCCESS {
                 return code;
@@ -168,10 +239,8 @@ pub fn run_app() -> ExitCode {
             let filtered = replace_command_with_exit(rest);
             let mut check_args = vec!["develop".to_string()];
             check_args.extend(with_json(&filtered));
-            let check_config = Config {
-                silent: true,
-                piping: false,
-            };
+            let mut check_config = base_config;
+            check_config.silent = true;
             let code = run_monitored_command("nix", &check_args, check_config);
             if code != ExitCode::SUCCESS {
                 return code;
@@ -190,17 +259,11 @@ pub fn run_app() -> ExitCode {
         ("nom", [sub, rest @ ..]) if sub == "flake" => {
             let mut full_args = vec!["flake".to_string()];
             full_args.extend(with_json(rest));
-            let config = Config {
-                silent: false,
-                piping: false,
-            };
-            run_monitored_command("nix", &full_args, config)
+            run_monitored_command("nix", &full_args, base_config)
         }
         ("nom", []) => {
-            let config = Config {
-                silent: false,
-                piping: true,
-            };
+            let mut config = base_config;
+            config.piping = true;
             let final_state = monitor_stream(io::stdin(), false, config);
             if final_state.full_summary.failed_builds.is_empty()
                 && final_state.nix_errors.is_empty()
@@ -211,10 +274,8 @@ pub fn run_app() -> ExitCode {
             }
         }
         ("nom", [arg]) if arg == "--json" => {
-            let config = Config {
-                silent: false,
-                piping: true,
-            };
+            let mut config = base_config;
+            config.piping = true;
             let final_state = monitor_stream(io::stdin(), true, config);
             if final_state.full_summary.failed_builds.is_empty()
                 && final_state.nix_errors.is_empty()
@@ -237,7 +298,17 @@ pub fn run_app() -> ExitCode {
 
 fn handle_completions(prog_name: &str, args: &[String]) -> ExitCode {
     let known_sub_commands = ["build", "copy", "shell", "develop"];
-    let known_flags = ["--version", "-h", "--help", "--json"];
+    let known_flags = [
+        "--version",
+        "-h",
+        "--help",
+        "--json",
+        "--sort-hosts-by-size",
+        "--sort-hosts-by-download-size",
+        "--sort-hosts-by-builds",
+        "--cap-hosts",
+        "--max-hosts",
+    ];
 
     match (prog_name, args) {
         ("nom", [input]) => {

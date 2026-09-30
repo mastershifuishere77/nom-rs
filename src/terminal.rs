@@ -18,6 +18,7 @@ pub const CURSOR_NEXT_LINE_1: &str = "\x1b[1E";
 pub struct TerminalRenderer {
     last_printed_line_count: usize,
     buffer: Vec<u8>,
+    finished: bool,
 }
 
 impl Default for TerminalRenderer {
@@ -35,10 +36,12 @@ impl TerminalRenderer {
         TerminalRenderer {
             last_printed_line_count: 0,
             buffer: Vec::with_capacity(4096),
+            finished: false,
         }
     }
 
     pub fn draw(&mut self, nix_output_lines: &[String], nom_output: &str, pad: bool) {
+        self.finished = false;
         let mut stderr = io::stderr().lock();
         let nix_lines_count = nix_output_lines.len();
         let reflow_correction: usize = if nix_lines_count == 0 {
@@ -130,6 +133,10 @@ impl TerminalRenderer {
     }
 
     pub fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
         let mut stderr = io::stderr().lock();
         let _ = stderr.write_all(SHOW_CURSOR.as_bytes());
         let _ = stderr.write_all(b"\n");
