@@ -15,8 +15,10 @@ use crate::state::{
 use crate::store_watcher::StoreWatcher;
 use crate::terminal::TerminalRenderer;
 use crate::types::{Derivation, StorePath};
+use compact_str::CompactString;
 use crossbeam_channel::{select, tick, unbounded};
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -43,7 +45,7 @@ pub fn monitor_stream<R: Read + Send + 'static>(
 
     // Spawn reader thread
     std::thread::spawn(move || {
-        let mut buf_reader = BufReader::new(reader);
+        let mut buf_reader = BufReader::with_capacity(65536, reader);
         if is_json {
             let mut line = String::new();
             while let Ok(n) = buf_reader.read_line(&mut line) {
@@ -59,6 +61,7 @@ pub fn monitor_stream<R: Read + Send + 'static>(
         } else {
             let mut buf = [0u8; 16384];
             let mut accumulated = String::new();
+            let mut start = 0;
             while let Ok(n) = buf_reader.read(&mut buf) {
                 if n == 0 {
                     break;
@@ -66,22 +69,28 @@ pub fn monitor_stream<R: Read + Send + 'static>(
                 let chunk = String::from_utf8_lossy(&buf[..n]);
                 accumulated.push_str(&chunk);
 
-                while !accumulated.is_empty() {
-                    if let Some((msg, consumed)) = parse_old_style_chunk(&accumulated) {
-                        let line = accumulated[..consumed].to_string();
-                        accumulated.drain(..consumed);
+                while start < accumulated.len() {
+                    let rest = &accumulated[start..];
+                    if let Some((msg, consumed)) = parse_old_style_chunk(rest) {
+                        let line = rest[..consumed].to_string();
+                        start += consumed;
                         let _ = input_tx.send(InputEvent::OldStyle(Some(msg), line));
-                    } else if let Some(idx) = accumulated.find('\n') {
-                        let line = accumulated[..=idx].to_string();
-                        accumulated.drain(..=idx);
+                    } else if let Some(idx) = rest.find('\n') {
+                        let line = rest[..=idx].to_string();
+                        start += idx + 1;
                         let _ = input_tx.send(InputEvent::OldStyle(None, line));
                     } else {
                         break;
                     }
                 }
+
+                if start > 0 {
+                    accumulated.drain(..start);
+                    start = 0;
+                }
             }
-            if !accumulated.is_empty() {
-                let _ = input_tx.send(InputEvent::OldStyle(None, accumulated));
+            if start < accumulated.len() {
+                let _ = input_tx.send(InputEvent::OldStyle(None, accumulated[start..].to_string()));
             }
         }
     });
@@ -176,6 +185,7 @@ pub fn monitor_stream<R: Read + Send + 'static>(
     }
 
     // Finalizer
+    watcher.flush_existing();
     let now = start_instant.elapsed().as_secs_f64();
     while let Ok((host, drv_id)) = watcher.event_receiver.try_recv() {
         finish_build_by_drv_id(&mut state, &host, drv_id, now, &reports_writer);
@@ -206,31 +216,13 @@ fn detect_current_system() -> Option<String> {
     }
 
     match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("x86_64", "linux") => return Some("x86_64-linux".to_string()),
-        ("aarch64", "linux") => return Some("aarch64-linux".to_string()),
-        ("i686", "linux") => return Some("i686-linux".to_string()),
-        ("riscv64", "linux") => return Some("riscv64-linux".to_string()),
-        ("x86_64", "macos") => return Some("x86_64-darwin".to_string()),
-        ("aarch64", "macos") => return Some("aarch64-darwin".to_string()),
-        _ => {}
-    }
-
-    let output = std::process::Command::new("nix")
-        .args([
-            "eval",
-            "--extra-experimental-features",
-            "nix-command",
-            "--impure",
-            "--raw",
-            "--expr",
-            "builtins.currentSystem",
-        ])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
+        ("x86_64", "linux") => Some("x86_64-linux".to_string()),
+        ("aarch64", "linux") => Some("aarch64-linux".to_string()),
+        ("i686", "linux") => Some("i686-linux".to_string()),
+        ("riscv64", "linux") => Some("riscv64-linux".to_string()),
+        ("x86_64", "macos") => Some("x86_64-darwin".to_string()),
+        ("aarch64", "macos") => Some("aarch64-darwin".to_string()),
+        (arch, os) => Some(format!("{}-{}", arch, os)),
     }
 }
 
@@ -243,45 +235,14 @@ fn read_and_parse_derivation(drv: &Derivation) -> Option<(Derivation, ParsedDeri
 }
 
 pub fn parallel_prefetch_derivations(drvs: &[Derivation]) -> Vec<(Derivation, ParsedDerivation)> {
-    if drvs.is_empty() {
-        return Vec::new();
-    }
-    if drvs.len() <= 3 {
+    if drvs.len() < 16 {
         return drvs.iter().filter_map(read_and_parse_derivation).collect();
     }
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(drvs.len())
-        .min(8);
-
-    if num_threads <= 1 {
-        return drvs.iter().filter_map(read_and_parse_derivation).collect();
-    }
-
-    let chunk_size = drvs.len().div_ceil(num_threads);
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in drvs.chunks(chunk_size) {
-            handles.push(s.spawn(move || {
-                let mut results = Vec::with_capacity(chunk.len());
-                for drv in chunk {
-                    if let Some(res) = read_and_parse_derivation(drv) {
-                        results.push(res);
-                    }
-                }
-                results
-            }));
-        }
-        let mut all = Vec::with_capacity(drvs.len());
-        for h in handles {
-            if let Ok(res) = h.join() {
-                all.extend(res);
-            }
-        }
-        all
-    })
+    use rayon::prelude::*;
+    drvs.par_iter()
+        .filter_map(read_and_parse_derivation)
+        .collect()
 }
 
 fn process_json_message(
@@ -354,8 +315,18 @@ fn process_json_message(
         }
         NixJsonMessage::Result(action) => match action.result {
             crate::parser::json::ActivityResult::BuildLogLine(line) => {
-                let prefix = get_activity_prefix(state, action.id);
-                logs.push(format!("{}{}", prefix, line));
+                if let Some(act) = state.activities.get(&action.id) {
+                    if act.prefix.is_empty() {
+                        logs.push(line);
+                    } else {
+                        let mut full = String::with_capacity(act.prefix.len() + line.len());
+                        full.push_str(&act.prefix);
+                        full.push_str(&line);
+                        logs.push(full);
+                    }
+                } else {
+                    logs.push(line);
+                }
                 false
             }
             crate::parser::json::ActivityResult::SetPhase(phase) => {
@@ -419,6 +390,7 @@ fn process_json_message(
                     phase: None,
                     progress: None,
                     file_transfer_progress: None,
+                    prefix: CompactString::new(&prefix),
                 },
             );
 
@@ -448,8 +420,12 @@ fn process_json_message(
                             return true;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        state.activities.remove(&action.id);
+                    }
                 }
+            } else {
+                state.activities.remove(&action.id);
             }
             false
         }
@@ -516,7 +492,7 @@ fn process_old_style_message(
                     })
                     .cloned()
                     .collect();
-                if uncached.len() >= 2 {
+                if uncached.len() >= 16 {
                     let prefetched = parallel_prefetch_derivations(&uncached);
                     for (d, p) in prefetched {
                         state.parsed_drv_cache.insert(d, p);
@@ -552,6 +528,29 @@ fn process_old_style_message(
             }
         }
     } else {
+        let stripped = crate::parser::old_style::strip_ansi_codes(&raw_line);
+        let trimmed = stripped.trim();
+        if trimmed.starts_with("/nix/store/") {
+            if trimmed.ends_with(".drv") {
+                if let Some(drv) = Derivation::parse(trimmed) {
+                    let drv_id = lookup_derivation(state, &drv);
+                    let old_status = state.get_derivation(drv_id).build_status.clone();
+                    if matches!(old_status, BuildStatus::Unknown) {
+                        update_derivation_state(state, drv_id, old_status, BuildStatus::Planned);
+                        return true;
+                    }
+                }
+            } else if let Some(sp) = StorePath::parse(trimmed) {
+                let path_id = state.get_store_path_id(&sp);
+                let old_states = state.get_store_path(path_id).states.clone();
+                if old_states.is_empty() {
+                    let mut new_states = old_states.clone();
+                    new_states.insert(StorePathState::DownloadPlanned);
+                    update_store_path_states(state, path_id, old_states, new_states);
+                    return true;
+                }
+            }
+        }
         logs.push(raw_line);
         false
     }
@@ -593,14 +592,14 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
             .cloned()
             .collect();
 
-        if uncached_deps.len() >= 2 {
+        if uncached_deps.len() >= 16 {
             let prefetched = parallel_prefetch_derivations(&uncached_deps);
             for (d, p) in prefetched {
                 state.parsed_drv_cache.insert(d, p);
             }
         }
 
-        let mut output_map = HashMap::new();
+        let mut output_map = FxHashMap::default();
         for (name, sp) in parsed.outputs {
             let sp_id = state.get_store_path_id(&sp);
             state.get_store_path_mut(sp_id).producer = Some(drv_id);
@@ -620,7 +619,8 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
             let dep_mut = state.get_derivation_mut(dep_id);
             let was_first_parent = dep_mut.derivation_parents.is_empty();
             dep_mut.derivation_parents.insert(drv_id);
-            if was_first_parent {
+            if was_first_parent && dep_mut.is_root {
+                dep_mut.is_root = false;
                 if let Some(pos) = state.forest_roots.iter().position(|&r| r == dep_id) {
                     state.forest_roots.swap_remove(pos);
                 }
@@ -639,7 +639,8 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
         drv_mut.platform = Some(parsed.platform);
         drv_mut.pname = parsed.pname;
 
-        if drv_mut.derivation_parents.is_empty() && !state.forest_roots.contains(&drv_id) {
+        if drv_mut.derivation_parents.is_empty() && !drv_mut.is_root {
+            drv_mut.is_root = true;
             state.forest_roots.push(drv_id);
         }
         return drv_id;
@@ -647,7 +648,8 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
 
     let drv_mut = state.get_derivation_mut(drv_id);
     drv_mut.cached = true;
-    if drv_mut.derivation_parents.is_empty() && !state.forest_roots.contains(&drv_id) {
+    if drv_mut.derivation_parents.is_empty() && !drv_mut.is_root {
+        drv_mut.is_root = true;
         state.forest_roots.push(drv_id);
     }
 
@@ -744,6 +746,10 @@ fn finish_build_by_drv_id(
             end: now,
         });
 
+        if let Some(act_id) = bi.activity_id {
+            state.activities.remove(&act_id);
+        }
+
         update_derivation_state(state, drv_id, old_status, new_status);
     }
 }
@@ -768,7 +774,7 @@ fn update_derivation_state(
 
     let parents = &state.get_derivation(drv_id).derivation_parents;
     if parents.is_empty() {
-        state.touched_ids.insert(drv_id);
+        state.touched_ids.insert(drv_id.0 as u32);
         return;
     }
     let parents_vec: Vec<DerivationId> = parents.iter().copied().collect();
@@ -786,7 +792,7 @@ fn update_derivation_state(
         |sum| NomState::clear_derivation_id_from_summary(sum, &old_status, drv_id),
         &parents_vec,
     );
-    state.touched_ids.insert(drv_id);
+    state.touched_ids.insert(drv_id.0 as u32);
 }
 
 fn start_downloading(
@@ -925,13 +931,6 @@ fn update_store_path_states(
     state.get_store_path_mut(path_id).states = new_states;
 }
 
-fn get_activity_prefix(state: &NomState, act_id: u64) -> String {
-    if let Some(act) = state.activities.get(&act_id) {
-        get_activity_prefix_for_activity(state, &act.activity)
-    } else {
-        String::new()
-    }
-}
 
 fn get_activity_prefix_for_activity(state: &NomState, act: &Activity) -> String {
     if let Activity::Build { drv, .. } = act {

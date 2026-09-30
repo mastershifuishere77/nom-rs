@@ -1,15 +1,12 @@
 use crate::types::{Derivation, OutputName, StorePath};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct ParsedDerivation {
-    pub outputs: HashMap<OutputName, StorePath>,
-    pub input_drvs: HashMap<Derivation, Vec<OutputName>>,
+    pub outputs: FxHashMap<OutputName, StorePath>,
+    pub input_drvs: FxHashMap<Derivation, Vec<OutputName>>,
     pub input_srcs: Vec<StorePath>,
     pub platform: String,
-    pub builder: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
     pub pname: Option<String>,
 }
 
@@ -120,9 +117,11 @@ impl<'a> Lexer<'a> {
                 if self.input[idx] == b'"' {
                     self.pos = idx + 1;
                     return Ok(());
-                } else {
+                } else if idx + 1 < self.input.len() {
                     // Backslash escape: skip the backslash and the escaped byte
                     self.pos = idx + 2;
+                } else {
+                    return Err(DerivationParseError::UnexpectedEof);
                 }
             } else {
                 return Err(DerivationParseError::UnexpectedEof);
@@ -162,7 +161,7 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
     lexer.expect(b'(')?;
 
     // 1. outputs: [ ("out", "/nix/store/...", "hashAlgo", "hash"), ... ]
-    let mut outputs = HashMap::new();
+    let mut outputs = FxHashMap::default();
     lexer.expect(b'[')?;
     if lexer.peek() != Some(b']') {
         loop {
@@ -191,7 +190,7 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
     lexer.expect(b',')?;
 
     // 2. inputDrvs: [ ("/nix/store/...drv", ["out", ...]), ... ]
-    let mut input_drvs = HashMap::new();
+    let mut input_drvs = FxHashMap::default();
     lexer.expect(b'[')?;
     if lexer.peek() != Some(b']') {
         loop {
@@ -300,9 +299,6 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
         input_drvs,
         input_srcs,
         platform,
-        builder: String::new(),
-        args: Vec::new(),
-        env: HashMap::new(),
         pname,
     })
 }

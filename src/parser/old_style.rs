@@ -74,27 +74,28 @@ fn extract_tick_content(s: &str) -> Option<&str> {
 }
 
 pub fn parse_old_style_chunk(chunk: &str) -> Option<(NixOldStyleMessage, usize)> {
-    let stripped = strip_ansi_codes(chunk);
-    let lines: Vec<&str> = stripped.lines().collect();
-    if lines.is_empty() {
+    let mut line_iter = chunk.split_inclusive('\n');
+    let first_raw = line_iter.next()?;
+    let first_stripped = strip_ansi_codes(first_raw);
+    let first = first_stripped.trim();
+    if first.is_empty() {
         return None;
     }
-
-    let first = lines[0].trim();
 
     // 1. Plan Builds
     if first.ends_with("will be built:") {
         let mut drvs = BTreeSet::new();
         let mut last_drv = None;
-        let mut consumed_lines = 1;
+        let mut consumed_bytes = first_raw.len();
 
-        for line in &lines[1..] {
-            let trimmed = line.trim();
+        for raw_line in chunk[first_raw.len()..].split_inclusive('\n') {
+            let stripped_line = strip_ansi_codes(raw_line);
+            let trimmed = stripped_line.trim();
             if trimmed.starts_with("/nix/store/") && trimmed.ends_with(".drv") {
                 if let Some(drv) = Derivation::parse(trimmed) {
                     last_drv = Some(drv.clone());
                     drvs.insert(drv);
-                    consumed_lines += 1;
+                    consumed_bytes += raw_line.len();
                     continue;
                 }
             }
@@ -102,8 +103,7 @@ pub fn parse_old_style_chunk(chunk: &str) -> Option<(NixOldStyleMessage, usize)>
         }
 
         if let Some(last) = last_drv {
-            let bytes_consumed = lines[..consumed_lines].iter().map(|l| l.len() + 1).sum();
-            return Some((NixOldStyleMessage::PlanBuilds(drvs, last), bytes_consumed));
+            return Some((NixOldStyleMessage::PlanBuilds(drvs, last), consumed_bytes));
         }
     }
 
@@ -128,29 +128,29 @@ pub fn parse_old_style_chunk(chunk: &str) -> Option<(NixOldStyleMessage, usize)>
             .unwrap_or(0.0);
 
         let mut paths = BTreeSet::new();
-        let mut consumed_lines = 1;
-        for line in &lines[1..] {
-            let trimmed = line.trim();
+        let mut consumed_bytes = first_raw.len();
+        for raw_line in chunk[first_raw.len()..].split_inclusive('\n') {
+            let stripped_line = strip_ansi_codes(raw_line);
+            let trimmed = stripped_line.trim();
             if trimmed.starts_with("/nix/store/") {
                 if let Some(sp) = StorePath::parse(trimmed) {
                     paths.insert(sp);
-                    consumed_lines += 1;
+                    consumed_bytes += raw_line.len();
                     continue;
                 }
             }
             break;
         }
 
-        let bytes_consumed = lines[..consumed_lines].iter().map(|l| l.len() + 1).sum();
         return Some((
             NixOldStyleMessage::PlanDownloads(download_size, unpacked_size, paths),
-            bytes_consumed,
+            consumed_bytes,
         ));
     }
 
     // Single line messages
-    let line = lines[0];
-    let line_len = line.len() + 1;
+    let line = first_stripped.trim_end_matches(['\r', '\n']);
+    let line_len = first_raw.len();
 
     // 3. building '...' on '...'... or building '...'...
     if line.starts_with("building '") {
@@ -220,21 +220,24 @@ pub fn parse_old_style_chunk(chunk: &str) -> Option<(NixOldStyleMessage, usize)>
     }
 
     // 8. Cannot build '...'. Reason: builder failed with exit code N.
-    if line.contains("Cannot build '")
-        && lines.len() >= 2
-        && lines[1].contains("failed with exit code")
-    {
-        let drv_str = extract_tick_content(line)?;
-        let drv = Derivation::parse(drv_str)?;
-        let second_line = lines[1];
-        let idx = second_line.find("failed with exit code")? + "failed with exit code".len();
-        let code_part = second_line[idx..].trim_matches(|c: char| !c.is_ascii_digit());
-        let code: i32 = code_part.parse().unwrap_or(1);
-        let bytes_consumed = lines[0].len() + 1 + lines[1].len() + 1;
-        return Some((
-            NixOldStyleMessage::Failed(drv, FailType::ExitCode(code)),
-            bytes_consumed,
-        ));
+    if line.contains("Cannot build '") {
+        let mut second_iter = chunk.split_inclusive('\n').skip(1);
+        if let Some(second_raw) = second_iter.next() {
+            let second_stripped = strip_ansi_codes(second_raw);
+            let second_line = second_stripped.trim();
+            if second_line.contains("failed with exit code") {
+                let drv_str = extract_tick_content(line)?;
+                let drv = Derivation::parse(drv_str)?;
+                let idx = second_line.find("failed with exit code")? + "failed with exit code".len();
+                let code_part = second_line[idx..].trim_matches(|c: char| !c.is_ascii_digit());
+                let code: i32 = code_part.parse().unwrap_or(1);
+                let bytes_consumed = first_raw.len() + second_raw.len();
+                return Some((
+                    NixOldStyleMessage::Failed(drv, FailType::ExitCode(code)),
+                    bytes_consumed,
+                ));
+            }
+        }
     }
 
     // 9. hash mismatch in fixed-output derivation '...':

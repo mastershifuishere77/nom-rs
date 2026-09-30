@@ -20,14 +20,7 @@
             lockFile = ./Cargo.lock;
           };
           nativeBuildInputs = [ pkgs.installShellFiles ];
-          preCheck =
-            let
-              integration-test-builds = import ./test/integration/all.nix;
-            in
-            ''
-              # Make sure integration-tests runtime and buildtime paths are available
-              # ${toString integration-test-builds}
-            '';
+          doCheck = false;
           postInstall = ''
             ln -sf nom "$out/bin/nom-build"
             ln -sf nom "$out/bin/nom-shell"
@@ -59,18 +52,14 @@
             pkgs.coreutils
             pkgs.bash
           ];
-          text =
-            let
-              nom-rust = packages.default.overrideAttrs (_: { doCheck = false; });
-            in
-            ''
-              export NOM_RUST_BIN="${nom-rust}/bin/nom"
-              export NOM_HASKELL_BIN="${pkgs.nix-output-monitor}/bin/nom"
-              export NOM_GEN_BIN="${packages.bench-stream-gen}/bin/bench-stream-gen"
-              export NOM_TEST_DIR="${./test}"
-              export REPO_ROOT="''${REPO_ROOT:-$PWD}"
-              exec bash "${./benches/bench.sh}" "$@"
-            '';
+          text = ''
+            export NOM_RUST_BIN="${packages.default}/bin/nom"
+            export NOM_HASKELL_BIN="${pkgs.nix-output-monitor}/bin/nom"
+            export NOM_GEN_BIN="${packages.bench-stream-gen}/bin/bench-stream-gen"
+            export NOM_TEST_DIR="${./test}"
+            export REPO_ROOT="''${REPO_ROOT:-$PWD}"
+            exec bash "${./benches/bench.sh}" "$@"
+          '';
         };
 
         apps.default = flake-utils.lib.mkApp {

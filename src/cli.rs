@@ -286,14 +286,20 @@ fn run_monitored_command(program: &str, args: &[String], config: Config) -> Exit
     let stderr = child.stderr.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
+    let stdout_handle = std::thread::spawn(move || {
+        let mut stdout_buf = Vec::new();
+        let _ = stdout.read_to_end(&mut stdout_buf);
+        stdout_buf
+    });
+
     let _final_state = monitor_stream(stderr, true, config);
     let status = child.wait().unwrap();
 
-    let mut stdout_buf = Vec::new();
-    let _ = stdout.read_to_end(&mut stdout_buf);
-    if !stdout_buf.is_empty() {
-        let _ = io::stdout().write_all(&stdout_buf);
-        let _ = io::stdout().flush();
+    if let Ok(stdout_buf) = stdout_handle.join() {
+        if !stdout_buf.is_empty() {
+            let _ = io::stdout().write_all(&stdout_buf);
+            let _ = io::stdout().flush();
+        }
     }
 
     if let Some(code) = status.code() {

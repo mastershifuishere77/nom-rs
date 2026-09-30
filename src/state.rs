@@ -3,7 +3,10 @@ use crate::parser::json::{Activity, ActivityProgress};
 pub use crate::types::{
     Derivation, DerivationId, FailType, Host, OutputName, StorePath, StorePathId,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use compact_str::CompactString;
+use roaring::RoaringBitmap;
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProgressState {
@@ -112,11 +115,11 @@ pub enum BuildStatus {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DependencySummary {
-    pub planned_builds: BTreeSet<DerivationId>,
+    pub planned_builds: RoaringBitmap,
     pub running_builds: BTreeMap<DerivationId, RunningBuildInfo>,
     pub completed_builds: BTreeMap<DerivationId, CompletedBuildInfo>,
     pub failed_builds: BTreeMap<DerivationId, FailedBuildInfo>,
-    pub planned_downloads: BTreeSet<StorePathId>,
+    pub planned_downloads: RoaringBitmap,
     pub running_downloads: BTreeMap<StorePathId, RunningTransferInfo>,
     pub completed_downloads: BTreeMap<StorePathId, CompletedTransferInfo>,
     pub running_uploads: BTreeMap<StorePathId, RunningTransferInfo>,
@@ -139,7 +142,7 @@ impl DependencySummary {
     }
 
     pub fn merge(&mut self, other: &DependencySummary) {
-        self.planned_builds.extend(&other.planned_builds);
+        self.planned_builds |= &other.planned_builds;
         for (k, v) in &other.running_builds {
             self.running_builds.insert(*k, v.clone());
         }
@@ -149,7 +152,7 @@ impl DependencySummary {
         for (k, v) in &other.failed_builds {
             self.failed_builds.insert(*k, v.clone());
         }
-        self.planned_downloads.extend(&other.planned_downloads);
+        self.planned_downloads |= &other.planned_downloads;
         for (k, v) in &other.running_downloads {
             self.running_downloads.insert(*k, v.clone());
         }
@@ -186,7 +189,7 @@ pub struct InputDerivation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DerivationInfo {
     pub name: Derivation,
-    pub outputs: HashMap<OutputName, StorePathId>,
+    pub outputs: FxHashMap<OutputName, StorePathId>,
     pub input_derivations: Vec<InputDerivation>,
     pub input_sources: BTreeSet<StorePathId>,
     pub build_status: BuildStatus,
@@ -195,13 +198,14 @@ pub struct DerivationInfo {
     pub derivation_parents: BTreeSet<DerivationId>,
     pub pname: Option<String>,
     pub platform: Option<String>,
+    pub is_root: bool,
 }
 
 impl DerivationInfo {
     pub fn new(name: Derivation) -> Self {
         Self {
             name,
-            outputs: HashMap::new(),
+            outputs: FxHashMap::default(),
             input_derivations: Vec::new(),
             input_sources: BTreeSet::new(),
             build_status: BuildStatus::Unknown,
@@ -210,6 +214,7 @@ impl DerivationInfo {
             derivation_parents: BTreeSet::new(),
             pname: None,
             platform: None,
+            is_root: false,
         }
     }
 
@@ -254,12 +259,7 @@ pub struct ActivityStatus {
     pub phase: Option<String>,
     pub progress: Option<ActivityProgress>,
     pub file_transfer_progress: Option<ActivityProgress>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct InterestingActivity {
-    pub text: String,
-    pub start: f64,
+    pub prefix: CompactString,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -278,21 +278,20 @@ pub struct NomState {
     pub build_reports: BuildReportMap,
     pub start_time: f64,
     pub progress_state: ProgressState,
-    pub store_path_ids: HashMap<StorePath, StorePathId>,
-    pub derivation_ids: HashMap<Derivation, DerivationId>,
-    pub touched_ids: BTreeSet<DerivationId>,
-    pub activities: HashMap<u64, ActivityStatus>,
-    pub activity_parents: HashMap<u64, u64>,
+    pub store_path_ids: FxHashMap<StorePath, StorePathId>,
+    pub derivation_ids: FxHashMap<Derivation, DerivationId>,
+    pub touched_ids: RoaringBitmap,
+    pub activities: FxHashMap<u64, ActivityStatus>,
+    pub activity_parents: FxHashMap<u64, u64>,
     pub planned_download_bytes: Option<usize>,
     pub nix_errors: Vec<String>,
     pub nix_traces: Vec<String>,
     pub build_platform: Option<String>,
-    pub interesting_activities: HashMap<u64, InterestingActivity>,
     pub evaluation_state: EvalInfo,
-    pub parsed_drv_cache: HashMap<Derivation, crate::parser::derivation::ParsedDerivation>,
+    pub parsed_drv_cache: FxHashMap<Derivation, crate::parser::derivation::ParsedDerivation>,
     pub visited_epoch: Vec<u32>,
     pub current_epoch: u32,
-    pub remote_hosts: BTreeSet<String>,
+    pub remote_hosts: BTreeSet<CompactString>,
 }
 
 impl NomState {
@@ -305,18 +304,17 @@ impl NomState {
             build_reports: reports,
             start_time,
             progress_state: ProgressState::JustStarted,
-            store_path_ids: HashMap::new(),
-            derivation_ids: HashMap::new(),
-            touched_ids: BTreeSet::new(),
-            activities: HashMap::new(),
-            activity_parents: HashMap::new(),
+            store_path_ids: FxHashMap::default(),
+            derivation_ids: FxHashMap::default(),
+            touched_ids: RoaringBitmap::new(),
+            activities: FxHashMap::default(),
+            activity_parents: FxHashMap::default(),
             planned_download_bytes: None,
             nix_errors: Vec::new(),
             nix_traces: Vec::new(),
             build_platform,
-            interesting_activities: HashMap::new(),
             evaluation_state: EvalInfo::default(),
-            parsed_drv_cache: HashMap::new(),
+            parsed_drv_cache: FxHashMap::default(),
             visited_epoch: Vec::new(),
             current_epoch: 0,
             remote_hosts: BTreeSet::new(),
@@ -419,7 +417,7 @@ impl NomState {
         match new_status {
             BuildStatus::Unknown => {}
             BuildStatus::Planned => {
-                summary.planned_builds.insert(drv_id);
+                summary.planned_builds.insert(drv_id.0 as u32);
             }
             BuildStatus::Building(bi) => {
                 summary.running_builds.insert(drv_id, bi.clone());
@@ -448,7 +446,7 @@ impl NomState {
         match old_status {
             BuildStatus::Unknown => {}
             BuildStatus::Planned => {
-                summary.planned_builds.remove(&drv_id);
+                summary.planned_builds.remove(drv_id.0 as u32);
             }
             BuildStatus::Building(_) => {
                 summary.running_builds.remove(&drv_id);
@@ -458,9 +456,11 @@ impl NomState {
             }
             BuildStatus::Built(_) => {
                 summary.completed_builds.remove(&drv_id);
-                if summary.completed_builds.is_empty() {
-                    summary.latest_completed_build_end = None;
-                }
+                summary.latest_completed_build_end = summary
+                    .completed_builds
+                    .values()
+                    .map(|b| b.end)
+                    .max_by(|a, b| a.total_cmp(b));
             }
         }
     }
@@ -509,7 +509,7 @@ impl NomState {
     ) {
         match state {
             StorePathState::DownloadPlanned => {
-                summary.planned_downloads.insert(path_id);
+                summary.planned_downloads.insert(path_id.0 as u32);
             }
             StorePathState::Downloading(info) => {
                 summary.running_downloads.insert(path_id, info.clone());
@@ -540,7 +540,7 @@ impl NomState {
     ) {
         match state {
             StorePathState::DownloadPlanned => {
-                summary.planned_downloads.remove(&path_id);
+                summary.planned_downloads.remove(path_id.0 as u32);
             }
             StorePathState::Downloading(_) => {
                 summary.running_downloads.remove(&path_id);
@@ -550,9 +550,11 @@ impl NomState {
             }
             StorePathState::Downloaded(_) => {
                 summary.completed_downloads.remove(&path_id);
-                if summary.completed_downloads.is_empty() {
-                    summary.latest_completed_download_start = None;
-                }
+                summary.latest_completed_download_start = summary
+                    .completed_downloads
+                    .values()
+                    .map(|d| d.start)
+                    .max_by(|a, b| a.total_cmp(b));
             }
             StorePathState::Uploaded(_) => {
                 summary.completed_uploads.remove(&path_id);
@@ -612,7 +614,9 @@ impl NomState {
                 clear_func(&mut self.derivation_infos[parent.0].dependency_summary);
             }
         }
-        self.touched_ids.extend(all_parents);
+        for parent in all_parents {
+            self.touched_ids.insert(parent.0 as u32);
+        }
     }
 
     fn collect_parents_fast_epoch(

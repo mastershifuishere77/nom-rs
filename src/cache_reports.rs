@@ -1,7 +1,8 @@
 use crate::types::HostWithoutContext;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fd_lock::RwLock;
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -9,15 +10,7 @@ use std::path::{Path, PathBuf};
 pub const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 pub const HISTORY_LIMIT: usize = 10;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuildReport {
-    pub host: HostWithoutContext,
-    pub drv_name: String,
-    pub end_time: DateTime<Utc>,
-    pub build_secs: i64,
-}
-
-pub type BuildReportMap = HashMap<(HostWithoutContext, String), BTreeMap<DateTime<Utc>, i64>>;
+pub type BuildReportMap = FxHashMap<(HostWithoutContext, String), BTreeMap<DateTime<Utc>, i64>>;
 
 pub fn get_build_reports_dir() -> PathBuf {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
@@ -51,46 +44,35 @@ pub fn calculate_median(history: &BTreeMap<DateTime<Utc>, i64>) -> Option<i64> {
     if len == 0 {
         return None;
     }
-    if len <= 16 {
-        let mut values = [0i64; 16];
-        for (i, &v) in history.values().enumerate() {
-            values[i] = v;
-        }
-        let slice = &mut values[..len];
-        slice.sort_unstable();
-        if len % 2 == 1 {
-            Some(slice[len / 2])
-        } else {
-            let low = slice[(len / 2) - 1];
-            let high = slice[len / 2];
-            Some((low + high) / 2)
-        }
+    let mut values = [0i64; 16];
+    let count = len.min(16);
+    for (i, &v) in history.values().take(count).enumerate() {
+        values[i] = v;
+    }
+    let slice = &mut values[..count];
+    slice.sort_unstable();
+    if count % 2 == 1 {
+        Some(slice[count / 2])
     } else {
-        let mut values: Vec<i64> = history.values().copied().collect();
-        values.sort_unstable();
-        if len % 2 == 1 {
-            Some(values[len / 2])
-        } else {
-            let low = values[(len / 2) - 1];
-            let high = values[len / 2];
-            Some((low + high) / 2)
-        }
+        let low = slice[(count / 2) - 1];
+        let high = slice[count / 2];
+        Some((low + high) / 2)
     }
 }
 
 pub fn load_build_reports_from_dir(dir: &Path) -> BuildReportMap {
     let csv_path = dir.join("build-reports.csv");
     if !csv_path.exists() {
-        return HashMap::new();
+        return FxHashMap::default();
     }
 
     let file = match File::open(&csv_path) {
         Ok(f) => f,
-        Err(_) => return HashMap::new(),
+        Err(_) => return FxHashMap::default(),
     };
 
     let reader = BufReader::new(file);
-    let mut map: BuildReportMap = HashMap::new();
+    let mut map: BuildReportMap = FxHashMap::default();
 
     let mut lines = reader.lines();
     // Skip header line
@@ -122,7 +104,7 @@ pub fn load_build_reports_from_dir(dir: &Path) -> BuildReportMap {
         let host = if host_str.is_empty() || host_str == "localhost" {
             HostWithoutContext::Localhost
         } else {
-            HostWithoutContext::Hostname(host_str.to_string())
+            HostWithoutContext::Hostname(host_str.into())
         };
 
         let end_time = match NaiveDateTime::parse_from_str(time_str, TIME_FORMAT) {
@@ -142,7 +124,7 @@ pub fn load_build_reports_from_dir(dir: &Path) -> BuildReportMap {
     map
 }
 
-pub fn save_build_reports_to_dir(dir: &PathBuf, reports: &BuildReportMap) {
+pub fn save_build_reports_to_dir(dir: &Path, reports: &BuildReportMap) {
     let _ = fs::create_dir_all(dir);
     let csv_path = dir.join("build-reports.csv");
     let mut file = match File::create(csv_path) {
@@ -165,6 +147,52 @@ pub fn save_build_reports_to_dir(dir: &PathBuf, reports: &BuildReportMap) {
                 host_str, drv_name, formatted_time, build_secs
             );
         }
+    }
+}
+
+pub fn append_build_reports_locked(items: &[(HostWithoutContext, String, i64)]) {
+    if items.is_empty() {
+        return;
+    }
+    let dir = get_build_reports_dir();
+    let _ = fs::create_dir_all(&dir);
+    let lock_path = dir.join("build-reports.csv.lock");
+    let lock_file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut lock = RwLock::new(lock_file);
+    let _guard = lock.write();
+
+    let csv_path = dir.join("build-reports.csv");
+    let needs_header = !csv_path.exists();
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&csv_path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    if needs_header {
+        let _ = writeln!(file, "hostname,derivation name,utc time,build seconds");
+    }
+
+    let now_str = Utc::now().format(TIME_FORMAT).to_string();
+    for (host, drv_name, build_secs) in items {
+        let host_str = match host {
+            HostWithoutContext::Localhost => "",
+            HostWithoutContext::Hostname(h) => h.as_str(),
+        };
+        let _ = writeln!(file, "{},{},{},{}", host_str, drv_name, now_str, build_secs);
     }
 }
 
@@ -235,13 +263,8 @@ impl BuildReportsWriter {
                     pending.push(next);
                 }
                 if !pending.is_empty() {
-                    update_build_reports_locked(|reports| {
-                        let now = Utc::now();
-                        for (host, drv_name, build_secs) in pending.drain(..) {
-                            let entry = reports.entry((host, drv_name)).or_default();
-                            insert_history_with_limit(entry, now, build_secs);
-                        }
-                    });
+                    append_build_reports_locked(&pending);
+                    pending.clear();
                 }
             }
         });
@@ -262,16 +285,4 @@ impl BuildReportsWriter {
             let _ = h.join();
         }
     }
-}
-
-pub fn add_build_report(
-    host: HostWithoutContext,
-    drv_name: String,
-    build_secs: i64,
-) -> BuildReportMap {
-    let now = Utc::now();
-    update_build_reports_locked(|reports| {
-        let entry = reports.entry((host, drv_name)).or_default();
-        insert_history_with_limit(entry, now, build_secs);
-    })
 }

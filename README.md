@@ -47,19 +47,22 @@ While fully drop-in compatible with the original Haskell `nom` and tools like `n
 
 ## Benchmarks & Performance
 
-`nom-rs` is significantly faster than the original Haskell implementation across all workload sizes, delivering up to **23.3x speedup** on large streams and **up to 7.2x lower peak memory usage**:
+`nom-rs` is significantly faster than the original Haskell implementation across all workload sizes, delivering up to **84x speedup** on stream processing and up to **7.4x lower peak memory usage**:
 
-| Workload | Scale / Lines | Metric | `nom-rs` (Rust) | `nom` (Haskell) | Advantage |
+| Workload | Scale / Lines | Metric | `nom-rs` (Rust) | `nom` (Haskell) | Winner / Advantage |
 |:---|:---|:---|:---|:---|:---|
-| **Standard Build** (Small) | 77 lines (8 KB) | Execution time<br>Peak RAM (RSS) | **68.4 ms**<br>**4.3 MB** | 314.9 ms<br>30.6 MB | **4.6x faster**<br>**7.2x less RAM** |
-| **Multi-Drv Failures** (Medium) | 608 lines (80 KB) | Execution time<br>Peak RAM (RSS) | **22.9 ms**<br>**6.8 MB** | 207.8 ms<br>30.6 MB | **9.1x faster**<br>**4.5x less RAM** |
-| **Massive Build** (Large) | 100 pkgs, ~5,500 events (612 KB) | Execution time<br>Peak RAM (RSS) | **7.6 ms**<br>**4.4 MB** | 123.4 ms<br>30.6 MB | **16.3x faster**<br>**6.9x less RAM** |
-| **Ultra Load** | 500 pkgs, ~31,900 events (3.5 MB) | Execution time<br>Peak RAM (RSS) | **22.0 ms**<br>**8.6 MB** | 378.4 ms<br>30.6 MB | **17.2x faster**<br>**3.6x less RAM** |
-| **Mega Extreme** | 5,000 pkgs, ~105,800 events (12 MB) | Execution time<br>Peak RAM (RSS) | **60.2 ms**<br>**30.2 MB** | 1.240 s<br>34.2 MB | **20.6x faster**<br>**1.1x less RAM** |
-| **Wide Dependency Tree** | 10,000 pkgs, ~100,400 events (11 MB) | Execution time<br>Peak RAM (RSS) | **104.9 ms**<br>55.6 MB | 1.395 s<br>39.2 MB | **13.3x faster** |
-| **Giga Extreme** | 10,000 pkgs, **1,000,000 events** (111 MB) | Execution time<br>Peak RAM (RSS) | **404.6 ms**<br>73.9 MB | 9.425 s<br>44.2 MB | **23.3x faster** |
+| **Standard Build** (Small) | 77 lines (8 KB) | Execution time<br>Peak RAM (RSS) | **5.5 ms**<br>**4.2 MB** | 459.3 ms<br>30.6 MB | 🏆 **`nom-rs`** (84.1x faster)<br>🏆 **`nom-rs`** (7.4x less RAM) |
+| **Multi-Drv Failures** (Medium) | 608 lines (80 KB) | Execution time<br>Peak RAM (RSS) | **18.1 ms**<br>**6.7 MB** | 232.0 ms<br>30.8 MB | 🏆 **`nom-rs`** (12.8x faster)<br>🏆 **`nom-rs`** (4.6x less RAM) |
+| **Massive Build** (Large) | 100 pkgs, ~5,500 events (612 KB) | Execution time<br>Peak RAM (RSS) | **8.0 ms**<br>**4.5 MB** | 145.8 ms<br>30.9 MB | 🏆 **`nom-rs`** (18.2x faster)<br>🏆 **`nom-rs`** (6.9x less RAM) |
+| **Ultra Load** | 500 pkgs, ~31,000 events (3.5 MB) | Execution time<br>Peak RAM (RSS) | **21.6 ms**<br>**8.6 MB** | 405.8 ms<br>31.7 MB | 🏆 **`nom-rs`** (18.8x faster)<br>🏆 **`nom-rs`** (3.7x less RAM) |
+| **Mega Extreme** | 5,000 pkgs, ~105,000 events (12 MB) | Execution time<br>Peak RAM (RSS) | **61.5 ms**<br>**23.4 MB** | 1.282 s<br>36.0 MB | 🏆 **`nom-rs`** (20.8x faster)<br>🏆 **`nom-rs`** (1.5x less RAM) |
+| **Wide Dependency Tree** | 10,000 pkgs, ~100,000 events (11 MB) | Execution time<br>Peak RAM (RSS) | **66.8 ms**<br>**35.3 MB** | 1.448 s<br>42.3 MB | 🏆 **`nom-rs`** (21.7x faster)<br>🏆 **`nom-rs`** (1.2x less RAM) |
+| **Giga Extreme** | 10,000 pkgs, **1,000,000 events** (111 MB) | Execution time<br>Peak RAM (RSS) | **392.6 ms**<br>51.8 MB | 9.748 s<br>**43.7 MB** | 🏆 **`nom-rs`** (**24.8x faster**)<br>🏆 **`nom`** (1.2x less RAM) |
 
-> Measured on Linux using `hyperfine` (execution time) and GNU `time -v` (peak resident set size / Max RSS).
+> **Fair Breakdown**:
+> - **Execution Speed**: `nom-rs` wins **7 out of 7** tests (12.8x to 84.1x faster across all benchmarks).
+> - **Memory Usage (Max RSS)**: `nom-rs` wins **6 out of 7** tests (consuming up to 7.4x less RAM on typical builds). On the synthetic 1,000,000-event Giga stress test, Haskell's compact runtime holds a slight edge (43.7 MB vs 51.8 MB), while `nom-rs` finishes in **0.39s** vs Haskell's **9.75s** (24.8x faster).
+> - Measured on Linux using `hyperfine` (mean execution time) and GNU `time -v` (peak resident set size / Max RSS).
 
 ### Reproducing Benchmarks
 

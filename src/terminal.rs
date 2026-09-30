@@ -151,10 +151,9 @@ pub fn install_signal_handlers() -> Arc<AtomicBool> {
     // Using ctrlc or simple custom signal handling
     // When SIGINT occurs:
     let _ = ctrlc::set_handler(move || {
-        let mut stderr = io::stderr().lock();
-        let _ = stderr.write_all(SHOW_CURSOR.as_bytes());
-        let _ = stderr.write_all(b"\n");
-        let _ = stderr.flush();
+        let _ = io::stderr().write_all(SHOW_CURSOR.as_bytes());
+        let _ = io::stderr().write_all(b"\n");
+        let _ = io::stderr().flush();
         int_clone.store(true, Ordering::SeqCst);
         std::process::exit(130);
     });

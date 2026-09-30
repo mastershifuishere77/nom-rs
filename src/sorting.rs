@@ -1,9 +1,8 @@
 use crate::state::{
-    BuildStatus, DependencySummary, DerivationId, DerivationInfo, InputDerivation, NomState,
-    StorePathState,
+    BuildStatus, DependencySummary, DerivationId, DerivationInfo, NomState, StorePathState,
 };
+use roaring::RoaringBitmap;
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SortOrder {
@@ -66,107 +65,6 @@ pub struct SortKey {
     pub running_builds_neg: Reverse<usize>,
     pub running_downloads_neg: Reverse<usize>,
     pub waiting_count: usize,
-}
-
-pub fn sort_order_from_summary(summary: &DependencySummary) -> SortOrder {
-    if let Some(first_failed) = summary
-        .failed_builds
-        .values()
-        .map(|f| f.end.at)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Failed(first_failed);
-    }
-
-    if let Some(first_building) = summary
-        .running_builds
-        .values()
-        .map(|b| b.start)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Building(first_building);
-    }
-
-    if let Some(first_dl) = summary
-        .running_downloads
-        .values()
-        .map(|d| d.start)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Downloading(first_dl);
-    }
-
-    if let Some(first_ul) = summary
-        .running_uploads
-        .values()
-        .map(|u| u.start)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Uploading(first_ul);
-    }
-
-    if !summary.planned_builds.is_empty() {
-        return SortOrder::Waiting;
-    }
-
-    if !summary.planned_downloads.is_empty() {
-        return SortOrder::DownloadWaiting;
-    }
-
-    if let Some(latest_done) = summary.latest_completed_build_end {
-        return SortOrder::Done(latest_done);
-    }
-
-    if let Some(latest_dl) = summary.latest_completed_download_start {
-        return SortOrder::Downloaded(latest_dl);
-    }
-
-    if let Some(latest_ul) = summary
-        .completed_uploads
-        .values()
-        .map(|u| u.start)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        return SortOrder::Uploaded(latest_ul);
-    }
-
-    SortOrder::Unknown
-}
-
-pub fn summary_including_root(state: &NomState, drv_id: DerivationId) -> DependencySummary {
-    let drv = state.get_derivation(drv_id);
-    let mut sum = drv.dependency_summary.clone();
-    NomState::update_summary_for_derivation(
-        &mut sum,
-        &BuildStatus::Unknown,
-        &drv.build_status,
-        drv_id,
-    );
-    sum
-}
-
-pub fn summary_only_this_node(state: &NomState, drv_id: DerivationId) -> DependencySummary {
-    let drv = state.get_derivation(drv_id);
-    let mut sum = DependencySummary::default();
-    NomState::update_summary_for_derivation(
-        &mut sum,
-        &BuildStatus::Unknown,
-        &drv.build_status,
-        drv_id,
-    );
-
-    let empty_states = BTreeSet::new();
-    for &out_path_id in drv.outputs.values() {
-        let out_info = state.get_store_path(out_path_id);
-        NomState::update_summary_for_store_path(
-            &mut sum,
-            &empty_states,
-            &out_info.states,
-            out_path_id,
-        );
-    }
-
-    sum
 }
 
 pub fn sort_order_for_this_node(state: &NomState, drv: &DerivationInfo) -> SortOrder {
@@ -346,28 +244,25 @@ pub fn calculate_sort_key(state: &NomState, drv_id: DerivationId) -> SortKey {
         order_summary,
         running_builds_neg: Reverse(drv.dependency_summary.running_builds.len() + is_building),
         running_downloads_neg: Reverse(drv.dependency_summary.running_downloads.len()),
-        waiting_count: drv.dependency_summary.planned_builds.len()
+        waiting_count: drv.dependency_summary.planned_builds.len() as usize
             + is_planned
-            + drv.dependency_summary.planned_downloads.len(),
+            + drv.dependency_summary.planned_downloads.len() as usize,
     }
 }
 
-pub fn sort_deps_of_set(state: &mut NomState, touched: &BTreeSet<DerivationId>) {
-    for &drv_id in touched {
+pub fn sort_deps_of_set(state: &mut NomState, touched: &RoaringBitmap) {
+    for raw_id in touched.iter() {
+        let drv_id = DerivationId(raw_id as usize);
         let num_inputs = state.derivation_infos[drv_id.0].input_derivations.len();
         if num_inputs <= 1 {
             continue;
         }
 
         if num_inputs == 2 {
-            let k0 = calculate_sort_key(
-                state,
-                state.derivation_infos[drv_id.0].input_derivations[0].derivation,
-            );
-            let k1 = calculate_sort_key(
-                state,
-                state.derivation_infos[drv_id.0].input_derivations[1].derivation,
-            );
+            let d0 = state.derivation_infos[drv_id.0].input_derivations[0].derivation;
+            let d1 = state.derivation_infos[drv_id.0].input_derivations[1].derivation;
+            let k0 = calculate_sort_key(state, d0);
+            let k1 = calculate_sort_key(state, d1);
             if k0 > k1 {
                 state.derivation_infos[drv_id.0]
                     .input_derivations
@@ -376,35 +271,9 @@ pub fn sort_deps_of_set(state: &mut NomState, touched: &BTreeSet<DerivationId>) 
             continue;
         }
 
-        let mut indexed_keys: Vec<(usize, SortKey)> = state.derivation_infos[drv_id.0]
-            .input_derivations
-            .iter()
-            .enumerate()
-            .map(|(orig_idx, input)| (orig_idx, calculate_sort_key(state, input.derivation)))
-            .collect();
-        indexed_keys.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let is_already_sorted = indexed_keys
-            .iter()
-            .enumerate()
-            .all(|(new_idx, (orig_idx, _))| new_idx == *orig_idx);
-        if is_already_sorted {
-            continue;
-        }
-
-        let mut old_inputs =
-            std::mem::take(&mut state.derivation_infos[drv_id.0].input_derivations);
-        let mut new_inputs = Vec::with_capacity(num_inputs);
-        for (orig_idx, _) in indexed_keys {
-            new_inputs.push(std::mem::replace(
-                &mut old_inputs[orig_idx],
-                InputDerivation {
-                    derivation: DerivationId(0),
-                    outputs: BTreeSet::new(),
-                },
-            ));
-        }
-        state.derivation_infos[drv_id.0].input_derivations = new_inputs;
+        let mut deps = std::mem::take(&mut state.derivation_infos[drv_id.0].input_derivations);
+        deps.sort_by_cached_key(|input| calculate_sort_key(state, input.derivation));
+        state.derivation_infos[drv_id.0].input_derivations = deps;
     }
 }
 

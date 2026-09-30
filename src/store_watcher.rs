@@ -1,11 +1,11 @@
 use crate::types::{DerivationId, Host, StorePath, STORE_PREFIX};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-type Subscriptions = Arc<Mutex<HashMap<StorePath, Vec<(Host, DerivationId)>>>>;
+type Subscriptions = Arc<Mutex<FxHashMap<StorePath, Vec<(Host, DerivationId)>>>>;
 
 pub struct StoreWatcher {
     _watcher: Option<RecommendedWatcher>,
@@ -23,7 +23,7 @@ impl Default for StoreWatcher {
 impl StoreWatcher {
     pub fn new() -> Self {
         let (tx, rx) = unbounded();
-        let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let subscriptions: Subscriptions = Arc::new(Mutex::new(FxHashMap::default()));
 
         let subs_clone = Arc::clone(&subscriptions);
         let tx_clone = tx.clone();
@@ -78,5 +78,20 @@ impl StoreWatcher {
         } else {
             subs.entry(path).or_default().push(payload);
         }
+    }
+
+    pub fn flush_existing(&self) {
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.retain(|path, payloads| {
+            let full_path = PathBuf::from(path.to_store_path_string());
+            if full_path.exists() {
+                for payload in payloads.drain(..) {
+                    let _ = self.event_sender.send(payload);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 }

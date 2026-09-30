@@ -14,7 +14,7 @@ use crate::state::{
     ProgressState, TransferInfo,
 };
 use chrono::Local;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use terminal_size::{terminal_size, Height, Width};
 
 pub const VERTICAL: &str = "┃";
@@ -269,12 +269,12 @@ fn render_builds(state: &NomState, _max_width: usize, max_height: usize, now: f6
 
 fn build_display_forest(
     state: &NomState,
-    host_abbrevs: &HashMap<String, String>,
+    host_abbrevs: &FxHashMap<String, String>,
     max_height: usize,
     now: f64,
 ) -> Vec<TreeNode<Option<f64>>> {
     let derivations_to_show = select_derivations_to_show(state, max_height);
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut result = Vec::new();
 
     for &root_id in &state.forest_roots {
@@ -294,9 +294,9 @@ fn build_display_forest(
     result
 }
 
-pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSet<DerivationId> {
+pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> FxHashSet<DerivationId> {
     if max_height == 0 {
-        return HashSet::new();
+        return FxHashSet::default();
     }
 
     // 1. Identify all truly active nodes:
@@ -304,11 +304,7 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
     // - Derivations that failed (BuildStatus::Failed)
     // - Derivations with running downloads or uploads on their outputs
     // - Derivations associated with running downloads/uploads from state.full_summary
-    let cap = state.full_summary.failed_builds.len()
-        + state.full_summary.running_builds.len()
-        + state.full_summary.running_downloads.len()
-        + state.full_summary.running_uploads.len();
-    let mut active_nodes: HashSet<DerivationId> = HashSet::with_capacity(cap);
+    let mut active_nodes: FxHashSet<DerivationId> = FxHashSet::default();
 
     for &drv_id in state.full_summary.failed_builds.keys() {
         active_nodes.insert(drv_id);
@@ -343,8 +339,8 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
 
     // 2. Identify all nodes that have active descendants (including the active nodes themselves)
     // and their entire ancestor paths up to roots using a unified multi-source BFS.
-    let mut active_path_nodes: HashSet<DerivationId> = active_nodes.clone();
-    let mut has_active_descendants: HashSet<DerivationId> = HashSet::new();
+    let mut active_path_nodes: FxHashSet<DerivationId> = active_nodes.clone();
+    let mut has_active_descendants: FxHashSet<DerivationId> = FxHashSet::default();
     let mut parent_queue: Vec<DerivationId> = active_nodes.iter().copied().collect();
 
     while let Some(p) = parent_queue.pop() {
@@ -363,7 +359,7 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
     }
 
     // Always include forest roots with non-empty summaries
-    let mut result = HashSet::new();
+    let mut result = FxHashSet::default();
     for &root_id in &state.forest_roots {
         if !state.is_summary_including_root_empty(root_id) {
             result.insert(root_id);
@@ -380,7 +376,7 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
             // For nodes that have active descendants, allow their immediate children
             // as collapsed leaves (sorted by sort_key) up to budget.
             // But NEVER recurse into children of an inactive sibling!
-            let mut seen_candidates = HashSet::new();
+            let mut seen_candidates = FxHashSet::default();
             let mut immediate_candidates: Vec<DerivationId> = Vec::new();
 
             for &parent_id in has_active_descendants.iter().chain(&state.forest_roots) {
@@ -450,9 +446,9 @@ pub fn select_derivations_to_show(state: &NomState, max_height: usize) -> HashSe
 fn build_tree_node(
     state: &NomState,
     drv_id: DerivationId,
-    derivations_to_show: &HashSet<DerivationId>,
-    seen: &mut HashSet<DerivationId>,
-    host_abbrevs: &HashMap<String, String>,
+    derivations_to_show: &FxHashSet<DerivationId>,
+    seen: &mut FxHashSet<DerivationId>,
+    host_abbrevs: &FxHashMap<String, String>,
     is_root: bool,
     now: f64,
 ) -> Option<TreeNode<Option<f64>>> {
@@ -495,7 +491,7 @@ fn build_tree_node(
                 || dep_sum.running_uploads.contains_key(&path_id)
                 || dep_sum.completed_downloads.contains_key(&path_id)
                 || dep_sum.completed_uploads.contains_key(&path_id)
-                || dep_sum.planned_downloads.contains(&path_id)
+                || dep_sum.planned_downloads.contains(path_id.0 as u32)
                 || !state.get_store_path(path_id).states.is_empty()
         });
     if matches!(drv.build_status, BuildStatus::Unknown)
@@ -519,7 +515,7 @@ fn format_derivation_row(
     drv: &DerivationInfo,
     _is_root: bool,
     is_leaf: bool,
-    host_abbrevs: &HashMap<String, String>,
+    host_abbrevs: &FxHashMap<String, String>,
     now: f64,
 ) -> (String, Option<f64>) {
     let drv_name = format_differing_platform(state, drv);
@@ -558,7 +554,7 @@ fn format_derivation_row(
             if let Some(ul) = dep_sum.completed_uploads.get(&path_id) {
                 cu.push(ul);
             }
-            if dep_sum.planned_downloads.contains(&path_id) {
+            if dep_sum.planned_downloads.contains(path_id.0 as u32) {
                 is_pd = true;
             }
         }
@@ -680,6 +676,8 @@ fn format_derivation_row(
                         parts.push(format!("{}{}{}", GREY, grey_parts.join(" "), RESET));
                     }
                     parts.join(" ")
+                } else if !drv.dependency_summary.is_empty() {
+                    format!("{}{} {}{}", BLUE, TODO, drv_name, RESET)
                 } else {
                     drv_name.clone()
                 }
@@ -762,7 +760,8 @@ fn format_derivation_row(
     };
 
     let is_planned = matches!(drv.build_status, BuildStatus::Planned)
-        || (matches!(drv.build_status, BuildStatus::Unknown) && is_planned_download);
+        || (matches!(drv.build_status, BuildStatus::Unknown)
+            && (is_planned_download || !drv.dependency_summary.is_empty()));
 
     let summary_str = if is_leaf && is_planned {
         let s = format_dependency_summary(&drv.dependency_summary);
@@ -820,10 +819,10 @@ fn format_differing_platform(state: &NomState, drv: &DerivationInfo) -> String {
             return format!("{}-{}", base_name, p2);
         }
     }
-    base_name
+    base_name.to_string()
 }
 
-fn format_single_host(host: &Host, host_abbrevs: &HashMap<String, String>, color: bool) -> String {
+fn format_single_host(host: &Host, host_abbrevs: &FxHashMap<String, String>, color: bool) -> String {
     match host {
         Host::Localhost => String::new(),
         _ => {
@@ -840,13 +839,13 @@ fn format_single_host(host: &Host, host_abbrevs: &HashMap<String, String>, color
 
 fn format_hosts<T>(
     transfers: &[&TransferInfo<T>],
-    host_abbrevs: &HashMap<String, String>,
+    host_abbrevs: &FxHashMap<String, String>,
     dir: &str,
 ) -> String {
     if host_abbrevs.len() <= 1 || transfers.is_empty() {
         return String::new();
     }
-    let unique_hosts: HashSet<&Host> = transfers.iter().map(|t| &t.host).collect();
+    let unique_hosts: FxHashSet<&Host> = transfers.iter().map(|t| &t.host).collect();
     let mut names = Vec::new();
     for h in unique_hosts {
         let h_str = h.hostname_only();
@@ -920,12 +919,12 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
     let s = &state.full_summary;
     let num_running_builds = s.running_builds.len();
     let num_completed_builds = s.completed_builds.len();
-    let num_planned_builds = s.planned_builds.len();
+    let num_planned_builds = s.planned_builds.len() as usize;
     let total_builds = num_running_builds + num_completed_builds + num_planned_builds;
 
     let num_running_dl = s.running_downloads.len();
     let num_completed_dl = s.completed_downloads.len();
-    let num_planned_dl = s.planned_downloads.len();
+    let num_planned_dl = s.planned_downloads.len() as usize;
     let total_dl = num_running_dl + num_completed_dl + num_planned_dl;
 
     let num_running_ul = s.running_uploads.len();
@@ -949,7 +948,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
     }
 
     static LOCALHOST: Host = Host::Localhost;
-    let mut host_stats: HashMap<&str, HostStats> = HashMap::new();
+    let mut host_stats: FxHashMap<&str, HostStats> = FxHashMap::default();
     host_stats.insert(
         LOCALHOST.hostname_only(),
         HostStats {
@@ -1124,9 +1123,7 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
             if *b == "localhost" {
                 return std::cmp::Ordering::Greater;
             }
-            let a_rev: Vec<&str> = a.split('.').rev().collect();
-            let b_rev: Vec<&str> = b.split('.').rev().collect();
-            a_rev.cmp(&b_rev)
+            a.split('.').rev().cmp(b.split('.').rev())
         });
         for h in sorted_keys {
             let stats = &host_stats[h];
@@ -1285,8 +1282,8 @@ pub fn non_zero_entry(symbol: &str, count: usize, color_fn: impl Fn(Entry) -> En
     }
 }
 
-fn compute_host_abbrevs(state: &NomState) -> HashMap<String, String> {
-    let mut remote_hosts: HashSet<&str> = HashSet::new();
+fn compute_host_abbrevs(state: &NomState) -> FxHashMap<String, String> {
+    let mut remote_hosts: FxHashSet<&str> = FxHashSet::default();
     for h in &state.remote_hosts {
         remote_hosts.insert(h.as_str());
     }
@@ -1307,10 +1304,10 @@ fn compute_host_abbrevs(state: &NomState) -> HashMap<String, String> {
     }
 
     if remote_hosts.len() <= 1 {
-        return HashMap::new();
+        return FxHashMap::default();
     }
 
-    let mut map = HashMap::with_capacity(remote_hosts.len());
+    let mut map = FxHashMap::default();
     for h in remote_hosts {
         let parts: Vec<&str> = h.split('.').collect();
         let abbrev = if parts.len() >= 2 {

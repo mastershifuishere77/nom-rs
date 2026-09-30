@@ -1,3 +1,4 @@
+use compact_str::CompactString;
 use std::fmt;
 
 pub const STORE_PREFIX: &str = "/nix/store/";
@@ -22,12 +23,12 @@ impl fmt::Display for StorePathId {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StorePath {
-    pub hash: String,
-    pub name: String,
+    pub hash: CompactString,
+    pub name: CompactString,
 }
 
 impl StorePath {
-    pub fn new(hash: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(hash: impl Into<CompactString>, name: impl Into<CompactString>) -> Self {
         Self {
             hash: hash.into(),
             name: name.into(),
@@ -58,37 +59,15 @@ impl StorePath {
             return None;
         }
         Some(Self {
-            hash: hash.to_string(),
-            name: name.to_string(),
+            hash: CompactString::new(hash),
+            name: CompactString::new(name),
         })
     }
 }
 
 #[inline(always)]
-fn is_ascii_alphanumeric_8(chunk: &[u8]) -> bool {
-    if chunk.len() < 8 {
-        return false;
-    }
-    let [b0, b1, b2, b3, b4, b5, b6, b7] = chunk[..8].try_into().unwrap();
-    b0.is_ascii_alphanumeric()
-        && b1.is_ascii_alphanumeric()
-        && b2.is_ascii_alphanumeric()
-        && b3.is_ascii_alphanumeric()
-        && b4.is_ascii_alphanumeric()
-        && b5.is_ascii_alphanumeric()
-        && b6.is_ascii_alphanumeric()
-        && b7.is_ascii_alphanumeric()
-}
-
-#[inline(always)]
 fn is_valid_nix_hash_32(bytes: &[u8]) -> bool {
-    if bytes.len() != 32 {
-        return false;
-    }
-    is_ascii_alphanumeric_8(&bytes[0..8])
-        && is_ascii_alphanumeric_8(&bytes[8..16])
-        && is_ascii_alphanumeric_8(&bytes[16..24])
-        && is_ascii_alphanumeric_8(&bytes[24..32])
+    bytes.len() == 32 && bytes.iter().all(u8::is_ascii_alphanumeric)
 }
 
 impl fmt::Display for StorePath {
@@ -104,17 +83,25 @@ pub struct Derivation {
 
 impl Derivation {
     pub fn parse(s: &str) -> Option<Self> {
-        let store_path = StorePath::parse(s)?;
-        if let Some(real_name) = store_path.name.strip_suffix(".drv") {
-            Some(Derivation {
-                store_path: StorePath {
-                    hash: store_path.hash,
-                    name: real_name.to_string(),
-                },
-            })
-        } else {
-            None
+        let path = s.strip_prefix(STORE_PREFIX).unwrap_or(s);
+        if path.len() < 37 {
+            return None;
         }
+        let (hash, rest) = path.split_at(32);
+        if !rest.starts_with('-') {
+            return None;
+        }
+        let name_with_drv = &rest[1..];
+        let real_name = name_with_drv.strip_suffix(".drv")?;
+        if !is_valid_nix_hash_32(hash.as_bytes()) {
+            return None;
+        }
+        Some(Derivation {
+            store_path: StorePath {
+                hash: CompactString::new(hash),
+                name: CompactString::new(real_name),
+            },
+        })
     }
 
     pub fn to_drv_string(&self) -> String {
@@ -137,7 +124,7 @@ impl fmt::Display for Derivation {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HostWithoutContext {
     Localhost,
-    Hostname(String),
+    Hostname(CompactString),
 }
 
 impl HostWithoutContext {
@@ -162,9 +149,9 @@ impl fmt::Display for HostWithoutContext {
 pub enum Host {
     Localhost,
     Remote {
-        proto: Option<String>,
-        user: Option<String>,
-        host: String,
+        proto: Option<CompactString>,
+        user: Option<CompactString>,
+        host: CompactString,
     },
 }
 
@@ -182,15 +169,15 @@ impl Host {
         }
 
         let (proto, rest) = if let Some(idx) = trimmed.find("://") {
-            (Some(trimmed[..idx].to_string()), &trimmed[idx + 3..])
+            (Some(CompactString::new(&trimmed[..idx])), &trimmed[idx + 3..])
         } else {
             (None, trimmed)
         };
 
         let (user, host) = if let Some(idx) = rest.find('@') {
-            (Some(rest[..idx].to_string()), rest[idx + 1..].to_string())
+            (Some(CompactString::new(&rest[..idx])), CompactString::new(&rest[idx + 1..]))
         } else {
-            (None, rest.to_string())
+            (None, CompactString::new(rest))
         };
 
         Host::Remote { proto, user, host }
@@ -199,7 +186,7 @@ impl Host {
     pub fn hostname_only(&self) -> &str {
         match self {
             Host::Localhost => "localhost",
-            Host::Remote { host, .. } => host,
+            Host::Remote { host, .. } => host.as_str(),
         }
     }
 
@@ -210,17 +197,6 @@ impl Host {
         }
     }
 
-    pub fn forget_proto(&self) -> Host {
-        match self {
-            Host::Localhost => Host::Localhost,
-            Host::Remote { host, .. } => Host::Remote {
-                proto: None,
-                user: None,
-                host: host.clone(),
-            },
-        }
-    }
-
     pub fn format_with_proto_context(&self) -> String {
         match self {
             Host::Localhost => "localhost".to_string(),
@@ -228,7 +204,7 @@ impl Host {
                 if let Some(p) = proto {
                     format!("{} ({})", host, p)
                 } else {
-                    host.clone()
+                    host.to_string()
                 }
             }
         }
@@ -277,7 +253,7 @@ pub enum OutputName {
     Lib,
     Man,
     Dist,
-    Other(String),
+    Other(CompactString),
 }
 
 impl OutputName {
@@ -291,7 +267,7 @@ impl OutputName {
             "lib" => OutputName::Lib,
             "man" => OutputName::Man,
             "dist" => OutputName::Dist,
-            _ => OutputName::Other(s.to_string()),
+            _ => OutputName::Other(CompactString::new(s)),
         }
     }
 

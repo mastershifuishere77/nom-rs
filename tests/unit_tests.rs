@@ -1,8 +1,7 @@
 use nix_output_monitor::parser::old_style::{parse_old_style_chunk, NixOldStyleMessage};
-use nix_output_monitor::render::progress::{
-    clamp_to_byte, lookup_progress_char, print_progress_bar, word5_to_word8,
-};
+
 use nix_output_monitor::types::{Derivation, FailType, Host, StorePath};
+use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 #[test]
@@ -102,19 +101,6 @@ fn test_parse_failed_build_nix229() {
     assert_eq!(msg, NixOldStyleMessage::Failed(drv, FailType::ExitCode(1)));
 }
 
-#[test]
-fn test_braille_progress_bar() {
-    assert_eq!(clamp_to_byte(-23.0), 0);
-    assert_eq!(clamp_to_byte(17.3), 18);
-    assert_eq!(clamp_to_byte(300.0), 31);
-    assert_eq!(word5_to_word8(31), 255);
-
-    assert_eq!(lookup_progress_char(31), '\u{28FF}');
-    assert_eq!(lookup_progress_char(0), '\u{2800}');
-
-    let bar = print_progress_bar(3, 0.477);
-    assert_eq!(bar, "\u{28FF}\u{2807}\u{2800}");
-}
 
 #[test]
 fn test_store_path_and_host_parsing() {
@@ -132,8 +118,8 @@ fn test_store_path_and_host_parsing() {
     let host2 = Host::parse("ssh://user@builder.example.com");
     match host2 {
         Host::Remote { proto, user, host } => {
-            assert_eq!(proto, Some("ssh".to_string()));
-            assert_eq!(user, Some("user".to_string()));
+            assert_eq!(proto.as_deref(), Some("ssh"));
+            assert_eq!(user.as_deref(), Some("user"));
             assert_eq!(host, "builder.example.com");
         }
         _ => panic!("Expected remote host"),
@@ -179,12 +165,9 @@ fn test_tree_selection_with_many_dependencies() {
     use nix_output_monitor::state::{BuildStatus, NomState};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
 
-    let mut state = NomState::new(0.0, None, std::collections::HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
     let root_drv = Derivation {
-        store_path: StorePath {
-            hash: "00000000000000000000000000000000".to_string(),
-            name: "root-package".to_string(),
-        },
+        store_path: StorePath::new("00000000000000000000000000000000", "root-package"),
     };
     let root_id = state.get_derivation_id(&root_drv);
     state.forest_roots.push(root_id);
@@ -192,10 +175,7 @@ fn test_tree_selection_with_many_dependencies() {
     let mut last_dep_id = None;
     for i in 0..30 {
         let dep_drv = Derivation {
-            store_path: StorePath {
-                hash: format!("{:032}", i),
-                name: format!("dep-{}", i),
-            },
+            store_path: StorePath::new(format!("{:032}", i), format!("dep-{}", i)),
         };
         let dep_id = state.get_derivation_id(&dep_drv);
         state
@@ -245,9 +225,10 @@ fn test_tree_selection_preserves_ancestor_chain() {
     use nix_output_monitor::render::select_derivations_to_show;
     use nix_output_monitor::state::{BuildInfo, BuildStatus, InputDerivation, NomState};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::{BTreeSet, HashMap};
+    use rustc_hash::FxHashMap;
+    use std::collections::BTreeSet;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     let names = [
         "root-app",
@@ -260,10 +241,7 @@ fn test_tree_selection_preserves_ancestor_chain() {
     let mut ids = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let drv = Derivation {
-            store_path: StorePath {
-                hash: format!("{:032x}", i + 1),
-                name: name.to_string(),
-            },
+            store_path: StorePath::new(format!("{:032x}", i + 1), *name),
         };
         ids.push(state.get_derivation_id(&drv));
     }
@@ -320,14 +298,12 @@ fn test_large_dependency_tree_render_end_to_end() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{BuildInfo, BuildStatus, InputDerivation, NomState};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::{BTreeSet, HashMap};
+    use rustc_hash::FxHashMap;
+    use std::collections::BTreeSet;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
     let root_drv = Derivation {
-        store_path: StorePath {
-            hash: "10000000000000000000000000000000".to_string(),
-            name: "massive-project".to_string(),
-        },
+        store_path: StorePath::new("10000000000000000000000000000000", "massive-project"),
     };
     let root_id = state.get_derivation_id(&root_drv);
     state.forest_roots.push(root_id);
@@ -335,10 +311,7 @@ fn test_large_dependency_tree_render_end_to_end() {
     let mut leaf_ids = Vec::new();
     for i in 0..100 {
         let dep_drv = Derivation {
-            store_path: StorePath {
-                hash: format!("{:032x}", i + 100),
-                name: format!("dep-pkg-{:03}", i),
-            },
+            store_path: StorePath::new(format!("{:032x}", i + 100), format!("dep-pkg-{:03}", i)),
         };
         let dep_id = state.get_derivation_id(&dep_drv);
         state
@@ -452,14 +425,11 @@ fn test_summary_table_colors_always_present_when_zero() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{BuildInfo, BuildStatus, NomState};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
     let drv = Derivation {
-        store_path: StorePath {
-            hash: "12345678901234567890123456789012".to_string(),
-            name: "test-drv".to_string(),
-        },
+        store_path: StorePath::new("12345678901234567890123456789012", "test-drv"),
     };
     let drv_id = state.get_derivation_id(&drv);
     let status = BuildStatus::Built(BuildInfo {
@@ -509,9 +479,9 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
     use nix_output_monitor::render::{render_state_to_text, Config, DOWN};
     use nix_output_monitor::state::{ActivityStatus, CompletedEnd, NomState, TransferInfo};
     use nix_output_monitor::types::{Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // Register an activity with progress: 71.4 MiB / 3.0 GiB
     let act_id = 42;
@@ -519,15 +489,8 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
         act_id,
         ActivityStatus {
             activity: Activity::CopyPath {
-                path: StorePath {
-                    hash: "hash1234567890123456789012345678".to_string(),
-                    name: "pkg1".to_string(),
-                },
-                from: Host::Remote {
-                    proto: Some("https".to_string()),
-                    user: None,
-                    host: "cache.nixos.org".to_string(),
-                },
+                path: StorePath::new("hash1234567890123456789012345678", "pkg1"),
+                from: Host::parse("https://cache.nixos.org"),
                 to: Host::Localhost,
             },
             phase: None,
@@ -538,22 +501,16 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
                 failed: 0,
             }),
             file_transfer_progress: None,
+            prefix: "".into(),
         },
     );
 
-    let sp_id = state.get_store_path_id(&StorePath {
-        hash: "hash1234567890123456789012345678".to_string(),
-        name: "pkg1".to_string(),
-    });
+    let sp_id = state.get_store_path_id(&StorePath::new("hash1234567890123456789012345678", "pkg1"));
 
     state.full_summary.running_downloads.insert(
         sp_id,
         TransferInfo {
-            host: Host::Remote {
-                proto: Some("https".to_string()),
-                user: None,
-                host: "cache.nixos.org".to_string(),
-            },
+            host: Host::parse("https://cache.nixos.org"),
             start: 0.0,
             activity_id: Some(act_id),
             end: (),
@@ -561,18 +518,11 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
     );
 
     // Also add a completed download
-    let sp_done_id = state.get_store_path_id(&StorePath {
-        hash: "done1234567890123456789012345678".to_string(),
-        name: "pkg-done".to_string(),
-    });
+    let sp_done_id = state.get_store_path_id(&StorePath::new("done1234567890123456789012345678", "pkg-done"));
     state.full_summary.completed_downloads.insert(
         sp_done_id,
         TransferInfo {
-            host: Host::Remote {
-                proto: Some("https".to_string()),
-                user: None,
-                host: "cache.nixos.org".to_string(),
-            },
+            host: Host::parse("https://cache.nixos.org"),
             start: 0.0,
             activity_id: None,
             end: CompletedEnd(Some(1.0)),
@@ -581,10 +531,7 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
 
     // Also add a build on Localhost so show_hosts is true (multiple hosts)
     let drv_id = state.get_derivation_id(&nix_output_monitor::types::Derivation {
-        store_path: StorePath {
-            hash: "local123456789012345678901234567".to_string(),
-            name: "local-build".to_string(),
-        },
+        store_path: StorePath::new("local123456789012345678901234567", "local-build"),
     });
     state.full_summary.running_builds.insert(
         drv_id,
@@ -626,35 +573,25 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
 fn test_inactive_deep_subtrees_pruning() {
     use nix_output_monitor::render::select_derivations_to_show;
     use nix_output_monitor::state::{BuildInfo, BuildStatus, InputDerivation, NomState};
-    use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // Create root
     let root = Derivation {
-        store_path: StorePath {
-            hash: "root0000000000000000000000000000".to_string(),
-            name: "system-root".to_string(),
-        },
+        store_path: StorePath::new("root0000000000000000000000000000", "system-root"),
     };
     let root_id = state.get_derivation_id(&root);
     state.forest_roots.push(root_id);
 
     // Active branch: root -> active_parent -> active_leaf
     let active_parent = Derivation {
-        store_path: StorePath {
-            hash: "actp0000000000000000000000000000".to_string(),
-            name: "active-parent".to_string(),
-        },
+        store_path: StorePath::new("actp0000000000000000000000000000", "active-parent"),
     };
     let active_parent_id = state.get_derivation_id(&active_parent);
 
     let active_leaf = Derivation {
-        store_path: StorePath {
-            hash: "actl0000000000000000000000000000".to_string(),
-            name: "active-leaf".to_string(),
-        },
+        store_path: StorePath::new("actl0000000000000000000000000000", "active-leaf"),
     };
     let active_leaf_id = state.get_derivation_id(&active_leaf);
 
@@ -711,10 +648,7 @@ fn test_inactive_deep_subtrees_pruning() {
     let mut deep_inactive_ids = Vec::new();
     for i in 1..=5 {
         let drv = Derivation {
-            store_path: StorePath {
-                hash: format!("inact{:028}", i),
-                name: format!("inactive-depth-{}", i),
-            },
+            store_path: StorePath::new(format!("inact{:028}", i), format!("inactive-depth-{}", i)),
         };
         let id = state.get_derivation_id(&drv);
         state.get_derivation_mut(id).build_status = BuildStatus::Planned;
@@ -766,26 +700,20 @@ fn test_inert_unknown_derivations_pruned() {
     use nix_output_monitor::render::{render_state_to_text, select_derivations_to_show, Config};
     use nix_output_monitor::state::{BuildStatus, CompletedBuildInfo, InputDerivation, NomState};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // Root: nixos-system
     let root = Derivation {
-        store_path: StorePath {
-            hash: "sys0000000000000000000000000000".to_string(),
-            name: "nixos-system".to_string(),
-        },
+        store_path: StorePath::new("sys0000000000000000000000000000", "nixos-system"),
     };
     let root_id = state.get_derivation_id(&root);
     state.forest_roots.push(root_id);
 
     // Completed build 1: etc
     let etc = Derivation {
-        store_path: StorePath {
-            hash: "etc0000000000000000000000000000".to_string(),
-            name: "etc".to_string(),
-        },
+        store_path: StorePath::new("etc0000000000000000000000000000", "etc"),
     };
     let etc_id = state.get_derivation_id(&etc);
     state.get_derivation_mut(etc_id).build_status = BuildStatus::Built(CompletedBuildInfo {
@@ -810,10 +738,7 @@ fn test_inert_unknown_derivations_pruned() {
 
     // Completed build 2: activate
     let act = Derivation {
-        store_path: StorePath {
-            hash: "act0000000000000000000000000000".to_string(),
-            name: "activate".to_string(),
-        },
+        store_path: StorePath::new("act0000000000000000000000000000", "activate"),
     };
     let act_id = state.get_derivation_id(&act);
     state.get_derivation_mut(act_id).build_status = BuildStatus::Built(CompletedBuildInfo {
@@ -847,37 +772,25 @@ fn test_inert_unknown_derivations_pruned() {
 
     // Inert direct child of root: stage-2-init.sh (Unknown, no activity)
     let stage2 = Derivation {
-        store_path: StorePath {
-            hash: "stg0000000000000000000000000000".to_string(),
-            name: "stage-2-init.sh".to_string(),
-        },
+        store_path: StorePath::new("stg0000000000000000000000000000", "stage-2-init.sh"),
     };
     let stage2_id = state.get_derivation_id(&stage2);
 
     // Inert child of root: pre-switch-checks
     let preswitch = Derivation {
-        store_path: StorePath {
-            hash: "pre0000000000000000000000000000".to_string(),
-            name: "pre-switch-checks".to_string(),
-        },
+        store_path: StorePath::new("pre0000000000000000000000000000", "pre-switch-checks"),
     };
     let preswitch_id = state.get_derivation_id(&preswitch);
 
     // Inert child of etc: system-path
     let syspath = Derivation {
-        store_path: StorePath {
-            hash: "path000000000000000000000000000".to_string(),
-            name: "system-path".to_string(),
-        },
+        store_path: StorePath::new("path000000000000000000000000000", "system-path"),
     };
     let syspath_id = state.get_derivation_id(&syspath);
 
     // Inert child of system-path: gnused
     let gnused = Derivation {
-        store_path: StorePath {
-            hash: "sed0000000000000000000000000000".to_string(),
-            name: "gnused-4.10".to_string(),
-        },
+        store_path: StorePath::new("sed0000000000000000000000000000", "gnused-4.10"),
     };
     let gnused_id = state.get_derivation_id(&gnused);
 
@@ -995,15 +908,15 @@ fn test_localhost_presence_and_order_before_builds() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{NomState, TransferInfo};
     use nix_output_monitor::types::{Derivation, Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // 1 planned build on localhost, but NOT yet building
     let drv = Derivation::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-foo-1.0.drv").unwrap();
     let drv_id = state.get_derivation_id(&drv);
     state.get_derivation_mut(drv_id).build_status = nix_output_monitor::state::BuildStatus::Planned;
-    state.full_summary.planned_builds.insert(drv_id);
+    state.full_summary.planned_builds.insert(drv_id.0 as u32);
 
     // 1 running download from cache.nixos.org
     let sp = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-1.0").unwrap();
@@ -1051,9 +964,9 @@ fn test_compressed_download_size_preferred_over_unpacked() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{ActivityStatus, NomState, TransferInfo};
     use nix_output_monitor::types::{Host, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
     let act_id = 100;
     let sp = StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-source").unwrap();
     let sp_id = state.get_store_path_id(&sp);
@@ -1081,6 +994,7 @@ fn test_compressed_download_size_preferred_over_unpacked() {
                 running: 1,
                 failed: 0,
             }),
+            prefix: "".into(),
         },
     );
 
@@ -1117,9 +1031,9 @@ fn test_single_substituter_does_not_display_from_abbrev() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{BuildInfo, NomState, TransferInfo};
     use nix_output_monitor::types::{Derivation, Host, OutputName, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // 1 local build on localhost
     let drv_build =
@@ -1195,9 +1109,9 @@ fn test_multiple_substituters_display_from_abbrev() {
     use nix_output_monitor::render::{render_state_to_text, Config};
     use nix_output_monitor::state::{NomState, TransferInfo};
     use nix_output_monitor::types::{Derivation, Host, OutputName, StorePath};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    let mut state = NomState::new(0.0, None, HashMap::new());
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
 
     // 2 downloads from 2 different substituters
     let sp1 = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep-1.0").unwrap();
@@ -1272,3 +1186,57 @@ fn test_multiple_substituters_display_from_abbrev() {
         rendered
     );
 }
+
+#[test]
+fn test_waiting_unknown_derivation_renders_with_todo_symbol() {
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use nix_output_monitor::state::{BuildInfo, BuildStatus, InputDerivation, NomState};
+    use nix_output_monitor::types::{Derivation, Host};
+    use rustc_hash::FxHashMap;
+
+    let mut state = NomState::new(0.0, None, FxHashMap::default());
+
+    // Parent has BuildStatus::Unknown, but active child is building
+    let parent = Derivation::parse("/nix/store/11111111111111111111111111111111-source-pkg.drv").unwrap();
+    let parent_id = state.get_derivation_id(&parent);
+    state.forest_roots.push(parent_id);
+
+    let child = Derivation::parse("/nix/store/22222222222222222222222222222222-child-build.drv").unwrap();
+    let child_id = state.get_derivation_id(&child);
+    let building_status = BuildStatus::Building(BuildInfo {
+        start: 0.0,
+        host: Host::Localhost,
+        estimate: None,
+        activity_id: None,
+        end: (),
+    });
+    state.get_derivation_mut(child_id).build_status = building_status.clone();
+
+    // Link parent -> child
+    state.get_derivation_mut(parent_id).input_derivations = vec![InputDerivation {
+        derivation: child_id,
+        outputs: std::collections::BTreeSet::new(),
+    }];
+    state.get_derivation_mut(child_id).derivation_parents.insert(parent_id);
+
+    NomState::update_summary_for_derivation(
+        &mut state.get_derivation_mut(parent_id).dependency_summary,
+        &BuildStatus::Unknown,
+        &building_status,
+        child_id,
+    );
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let rendered = render_state_to_text(&state, config, 1.0);
+
+    // parent MUST be rendered with ⏸ (TODO), never as bare uncolored text
+    assert!(
+        rendered.contains("⏸ source-pkg"),
+        "Parent with active dependencies MUST render with ⏸ TODO icon, got:\n{}",
+        rendered
+    );
+}
+

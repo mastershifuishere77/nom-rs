@@ -277,11 +277,6 @@ impl Entry {
     }
 }
 
-pub fn markup(style_fn: impl Fn(Entry) -> Entry, text: &str) -> String {
-    let entry = style_fn(Entry::text(text));
-    render_entry(&entry, entry.entry_width())
-}
-
 #[inline]
 pub fn render_entry_to(entry: &Entry, col_width: usize, out: &mut String) {
     for code in &entry.codes {
@@ -296,12 +291,6 @@ pub fn render_entry_to(entry: &Entry, col_width: usize, out: &mut String) {
     if !entry.codes.is_empty() {
         out.push_str(RESET);
     }
-}
-
-pub fn render_entry(entry: &Entry, col_width: usize) -> String {
-    let mut out = String::with_capacity(col_width + 16);
-    render_entry_to(entry, col_width, &mut out);
-    out
 }
 
 pub fn print_aligned_table(rows: &[Vec<Entry>], sep: &str) -> Vec<String> {

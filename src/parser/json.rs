@@ -139,7 +139,7 @@ struct RawJsonMessage<'a> {
 }
 
 fn try_parse_fast_build_log(json_str: &str) -> Option<(u64, String)> {
-    if !json_str.contains("\"action\":\"result\"") || !json_str.contains("\"type\":101") {
+    if !json_str.contains("\"type\":101") || !json_str.contains("\"action\":\"result\"") {
         return None;
     }
 
@@ -155,16 +155,11 @@ fn try_parse_fast_build_log(json_str: &str) -> Option<(u64, String)> {
 
     let bytes = rest.as_bytes();
     let len = bytes.len();
-    if len >= 2 && bytes[len - 2] == b'"' && bytes[len - 1] == b']' {
-        let content = &rest[..len - 2];
-        if memchr::memchr(b'\\', content.as_bytes()).is_none() {
-            return Some((id, content.to_string()));
-        }
-    }
-
     let mut i = 0;
+    let mut has_escape = false;
     while i < len {
         if bytes[i] == b'\\' {
+            has_escape = true;
             i += 2;
         } else if bytes[i] == b'"' {
             break;
@@ -172,12 +167,13 @@ fn try_parse_fast_build_log(json_str: &str) -> Option<(u64, String)> {
             i += 1;
         }
     }
+
     if i < len && rest[i..].starts_with("\"]") {
         let raw_str = &rest[..i];
-        if memchr::memchr(b'\\', raw_str.as_bytes()).is_none() {
+        if !has_escape {
             return Some((id, raw_str.to_string()));
         }
-        let unescaped: String = serde_json::from_str(&format!("\"{}\"", raw_str)).ok()?;
+        let unescaped: String = serde_json::from_str(&json_str[fields_idx - 1..=fields_idx + i]).ok()?;
         return Some((id, unescaped));
     }
 
