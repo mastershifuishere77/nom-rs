@@ -199,6 +199,7 @@ pub struct DerivationInfo {
     pub pname: Option<String>,
     pub platform: Option<String>,
     pub is_root: bool,
+    pub curl_progress: Option<crate::parser::curl::CurlProgress>,
 }
 
 impl DerivationInfo {
@@ -215,6 +216,7 @@ impl DerivationInfo {
             pname: None,
             platform: None,
             is_root: false,
+            curl_progress: None,
         }
     }
 
@@ -259,6 +261,7 @@ pub struct ActivityStatus {
     pub phase: Option<String>,
     pub progress: Option<ActivityProgress>,
     pub file_transfer_progress: Option<ActivityProgress>,
+    pub curl_progress: Option<crate::parser::curl::CurlProgress>,
     pub prefix: CompactString,
 }
 

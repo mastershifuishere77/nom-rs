@@ -1,5 +1,5 @@
 use nix_output_monitor::parser::old_style::{parse_old_style_chunk, NixOldStyleMessage};
-
+use nix_output_monitor::render::Config;
 use nix_output_monitor::types::{Derivation, FailType, Host, StorePath};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeSet;
@@ -501,6 +501,7 @@ fn test_downloads_table_four_columns_and_arrow_symbols() {
                 failed: 0,
             }),
             file_transfer_progress: None,
+            curl_progress: None,
             prefix: "".into(),
         },
     );
@@ -994,6 +995,7 @@ fn test_compressed_download_size_preferred_over_unpacked() {
                 running: 1,
                 failed: 0,
             }),
+            curl_progress: None,
             prefix: "".into(),
         },
     );
@@ -1239,4 +1241,98 @@ fn test_waiting_unknown_derivation_renders_with_todo_symbol() {
         rendered
     );
 }
+
+#[test]
+fn test_curl_progress_json_stream_end_to_end() {
+    use std::io::Cursor;
+    use nix_output_monitor::engine::monitor_stream;
+    use nix_output_monitor::render::render_state_to_text;
+
+    let json_input = concat!(
+        "@nix {\"action\":\"start\",\"fields\":[\"/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv\",\"local\"],\"id\":105,\"level\":3,\"text\":\"building '/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv'\",\"type\":105}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"trying https://cdn.geekbench.com/Geekbench-6.7.1-Linux.tar.gz\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"                                 Dload  Upload  Total   Spent   Left   Speed\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"  1 203.0M   1  2.93M   0      0  1.94M      0   01:44   00:01   01:43  2.89M\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\" 22 203.0M  22 45.82M   0      0  8.28M      0   00:24   00:05   00:19  9.09M\"],\"id\":105,\"type\":101}\n"
+    );
+
+    let config = Config {
+        silent: false,
+        piping: false,
+    };
+    let state = monitor_stream(Cursor::new(json_input), true, config);
+
+    let drv = Derivation::parse("/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv").unwrap();
+    let drv_id = state.derivation_ids.get(&drv).expect("derivation must be registered");
+    let drv_info = state.get_derivation(*drv_id);
+
+    let cp = drv_info.curl_progress.as_ref().expect("curl_progress must be present on derivation");
+    assert_eq!(cp.host.hostname_only(), "cdn.geekbench.com");
+    assert_eq!(cp.host.format_with_proto_context(), "cdn.geekbench.com (https)");
+    assert_eq!(cp.done_bytes, (45.82f64 * 1024.0 * 1024.0).round() as usize);
+    assert_eq!(cp.total_bytes, (203.0f64 * 1024.0 * 1024.0).round() as usize);
+
+    let rendered = render_state_to_text(&state, config, 2.0);
+    assert!(rendered.contains("cdn.geekbench.com"), "Rendered view must contain detected hostname:\n{}", rendered);
+    assert!(rendered.contains("45.8 MiB/203.0 MiB"), "Rendered view must contain transfer progress:\n{}", rendered);
+    assert!(!rendered.contains("9.09M/s"), "Rendered view must NOT contain speed:\n{}", rendered);
+}
+
+#[test]
+fn test_curl_progress_retry_resets_size_and_updates_mirror() {
+    use std::io::Cursor;
+    use nix_output_monitor::engine::monitor_stream;
+
+    let json_input = concat!(
+        "@nix {\"action\":\"start\",\"fields\":[\"/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv\",\"local\"],\"id\":105,\"level\":3,\"text\":\"building '/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv'\",\"type\":105}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"trying https://cdn.geekbench.com/Geekbench-6.7.1-Linux.tar.gz\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"  6 217.5M   6 14.46M   0      0  5.63M      0   00:38   00:02   00:36  7.15M\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"curl: (56) OpenSSL SSL_read: error\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"Warning: Problem (retrying all errors). Retrying in 1 second. 3 retries left.\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"trying https://backup.mirror.org/Geekbench-6.7.1-Linux.tar.gz\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"  0      0   0      0   0      0      0      0                              0\"],\"id\":105,\"type\":101}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\" 12 203.0M  12 24.79M   0      0  7.02M      0   00:28   00:03   00:25  8.17M\"],\"id\":105,\"type\":101}\n"
+    );
+
+    let config = Config {
+        silent: true,
+        piping: false,
+    };
+    let state = monitor_stream(Cursor::new(json_input), true, config);
+
+    let drv = Derivation::parse("/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-Geekbench-6.7.1-Linux.tar.gz.drv").unwrap();
+    let drv_id = state.derivation_ids.get(&drv).expect("derivation must be registered");
+    let drv_info = state.get_derivation(*drv_id);
+
+    let cp = drv_info.curl_progress.as_ref().expect("curl_progress must be present on derivation");
+    assert_eq!(cp.host.hostname_only(), "backup.mirror.org");
+    assert_eq!(cp.done_bytes, (24.79f64 * 1024.0 * 1024.0).round() as usize);
+    assert_eq!(cp.total_bytes, (203.0f64 * 1024.0 * 1024.0).round() as usize);
+}
+
+#[test]
+fn test_curl_progress_fallback_host_when_no_trying_line() {
+    use std::io::Cursor;
+    use nix_output_monitor::engine::monitor_stream;
+
+    let json_input = concat!(
+        "@nix {\"action\":\"start\",\"fields\":[\"/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-pkg.tar.gz.drv\",\"local\"],\"id\":105,\"level\":3,\"text\":\"building '/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-pkg.tar.gz.drv'\",\"type\":105}\n",
+        "@nix {\"action\":\"result\",\"fields\":[\"  5 100.0M   5  5.00M   0      0  1.00M      0   01:40   00:05   01:35  1.00M\"],\"id\":105,\"type\":101}\n"
+    );
+
+    let config = Config {
+        silent: true,
+        piping: false,
+    };
+    let state = monitor_stream(Cursor::new(json_input), true, config);
+
+    let drv = Derivation::parse("/nix/store/vh8zlb3v42hw7k19r193sn1l2idnan51-pkg.tar.gz.drv").unwrap();
+    let drv_id = state.derivation_ids.get(&drv).expect("derivation must be registered");
+    let drv_info = state.get_derivation(*drv_id);
+
+    let cp = drv_info.curl_progress.as_ref().expect("curl_progress must be present on derivation");
+    assert_eq!(cp.host.hostname_only(), "curl");
+}
+
 

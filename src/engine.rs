@@ -315,19 +315,69 @@ fn process_json_message(
         }
         NixJsonMessage::Result(action) => match action.result {
             crate::parser::json::ActivityResult::BuildLogLine(line) => {
-                if let Some(act) = state.activities.get(&action.id) {
-                    if act.prefix.is_empty() {
-                        logs.push(line);
-                    } else {
-                        let mut full = String::with_capacity(act.prefix.len() + line.len());
-                        full.push_str(&act.prefix);
-                        full.push_str(&line);
-                        logs.push(full);
-                    }
+                use crate::parser::curl::{classify_curl_line, CurlLogEvent, CurlProgress};
+
+                let event = classify_curl_line(&line);
+                let mut changed = false;
+
+                let (drv_id_opt, prefix) = if let Some(act) = state.activities.get(&action.id) {
+                    let drv_id = match &act.activity {
+                        Activity::Build { drv, .. } => state.derivation_ids.get(drv).copied(),
+                        _ => None,
+                    };
+                    (drv_id, act.prefix.clone())
                 } else {
-                    logs.push(line);
+                    (None, CompactString::default())
+                };
+
+                match event {
+                    CurlLogEvent::TargetUrl { host } => {
+                        if let Some(act) = state.activities.get_mut(&action.id) {
+                            let cp = act
+                                .curl_progress
+                                .get_or_insert_with(|| CurlProgress::new(host.clone()));
+                            cp.host = host.clone();
+                        }
+                        if let Some(drv_id) = drv_id_opt {
+                            let d_cp = state
+                                .get_derivation_mut(drv_id)
+                                .curl_progress
+                                .get_or_insert_with(|| CurlProgress::new(host.clone()));
+                            d_cp.host = host;
+                        }
+                        changed = true;
+                    }
+                    CurlLogEvent::Progress(snap) => {
+                        if let Some(act) = state.activities.get_mut(&action.id) {
+                            let cp = act
+                                .curl_progress
+                                .get_or_insert_with(CurlProgress::new_fallback);
+                            cp.done_bytes = snap.done_bytes;
+                            cp.total_bytes = snap.total_bytes;
+                        }
+                        if let Some(drv_id) = drv_id_opt {
+                            let d_cp = state
+                                .get_derivation_mut(drv_id)
+                                .curl_progress
+                                .get_or_insert_with(CurlProgress::new_fallback);
+                            d_cp.done_bytes = snap.done_bytes;
+                            d_cp.total_bytes = snap.total_bytes;
+                        }
+                        changed = true;
+                    }
+                    CurlLogEvent::HeaderNoise | CurlLogEvent::RegularLog => {}
                 }
-                false
+
+                if prefix.is_empty() {
+                    logs.push(line);
+                } else {
+                    let mut full = String::with_capacity(prefix.len() + line.len());
+                    full.push_str(&prefix);
+                    full.push_str(&line);
+                    logs.push(full);
+                }
+
+                changed
             }
             crate::parser::json::ActivityResult::SetPhase(phase) => {
                 if let Some(act) = state.activities.get_mut(&action.id) {
@@ -390,6 +440,7 @@ fn process_json_message(
                     phase: None,
                     progress: None,
                     file_transfer_progress: None,
+                    curl_progress: None,
                     prefix: CompactString::new(&prefix),
                 },
             );
@@ -530,6 +581,57 @@ fn process_old_style_message(
     } else {
         let stripped = crate::parser::old_style::strip_ansi_codes(&raw_line);
         let trimmed = stripped.trim();
+
+        if let Some(idx) = trimmed.find("> ") {
+            let prefix = &trimmed[..idx];
+            let body = &trimmed[idx + 2..];
+            use crate::parser::curl::{classify_curl_line, CurlLogEvent, CurlProgress};
+            let event = classify_curl_line(body);
+
+            let drv_id_opt = state.derivation_infos.iter().enumerate().find_map(|(idx, d)| {
+                if matches!(d.build_status, BuildStatus::Building(_)) {
+                    if d.get_report_name() == prefix || d.name.store_path.name.starts_with(prefix) {
+                        Some(DerivationId(idx))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+
+            match event {
+                CurlLogEvent::TargetUrl { host } => {
+                    if let Some(drv_id) = drv_id_opt {
+                        let d_cp = state
+                            .get_derivation_mut(drv_id)
+                            .curl_progress
+                            .get_or_insert_with(|| CurlProgress::new(host.clone()));
+                        d_cp.host = host;
+                    }
+                    logs.push(raw_line);
+                    return true;
+                }
+                CurlLogEvent::Progress(snap) => {
+                    if let Some(drv_id) = drv_id_opt {
+                        let d_cp = state
+                            .get_derivation_mut(drv_id)
+                            .curl_progress
+                            .get_or_insert_with(CurlProgress::new_fallback);
+                        d_cp.done_bytes = snap.done_bytes;
+                        d_cp.total_bytes = snap.total_bytes;
+                    }
+                    logs.push(raw_line);
+                    return true;
+                }
+                CurlLogEvent::HeaderNoise => {
+                    logs.push(raw_line);
+                    return false;
+                }
+                CurlLogEvent::RegularLog => {}
+            }
+        }
+
         if trimmed.starts_with("/nix/store/") {
             if trimmed.ends_with(".drv") {
                 if let Some(drv) = Derivation::parse(trimmed) {

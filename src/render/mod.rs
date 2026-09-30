@@ -691,10 +691,26 @@ fn format_derivation_row(
                     "{}{}{} {}{}",
                     BOLD, YELLOW, RUNNING, drv_name, RESET
                 ));
-                let host_str = format_single_host(&bi.host, host_abbrevs, true);
-                if !host_str.is_empty() {
-                    parts.push(host_str.trim().to_string());
+
+                let curl_progress = drv.curl_progress.as_ref().or_else(|| {
+                    bi.activity_id
+                        .and_then(|id| state.activities.get(&id))
+                        .and_then(|act| act.curl_progress.as_ref())
+                });
+
+                if let Some(cp) = curl_progress {
+                    if cp.host != Host::Localhost {
+                        let h_str = cp.host.hostname_only();
+                        let label = host_abbrevs.get(h_str).map(|s| s.as_str()).unwrap_or(h_str);
+                        parts.push(format!("from {}{}{}", MAGENTA, label, RESET));
+                    }
+                } else {
+                    let host_str = format_single_host(&bi.host, host_abbrevs, true);
+                    if !host_str.is_empty() {
+                        parts.push(host_str.trim().to_string());
+                    }
                 }
+
                 if let Some(act) = bi.activity_id.and_then(|id| state.activities.get(&id)) {
                     if let Some(phase) = &act.phase {
                         parts.push(format!("{}({}){}", BOLD, phase, RESET));
@@ -714,6 +730,29 @@ fn format_derivation_row(
                         parts.push(format!("{} {}", CLOCK, dur));
                     }
                 }
+
+                if let Some(cp) = curl_progress {
+                    if cp.total_bytes > 0 {
+                        progress_val = Some(cp.done_bytes as f64 / cp.total_bytes as f64);
+                        parts.push(format!(
+                            "{}{} {}/{}{}",
+                            GREEN,
+                            DOWN,
+                            print_bytes(cp.done_bytes),
+                            print_bytes(cp.total_bytes),
+                            RESET
+                        ));
+                    } else if cp.done_bytes > 0 {
+                        parts.push(format!(
+                            "{}{} {}{}",
+                            GREEN,
+                            DOWN,
+                            print_bytes(cp.done_bytes),
+                            RESET
+                        ));
+                    }
+                }
+
                 parts.join(" ")
             }
             BuildStatus::Failed(bi) => {
@@ -743,10 +782,30 @@ fn format_derivation_row(
             BuildStatus::Built(bi) => {
                 let main_str = format!("{}{} {}{}", GREEN, DONE, drv_name, RESET);
                 let mut extra_parts = Vec::new();
-                let host_str = format_single_host(&bi.host, host_abbrevs, false);
-                if !host_str.is_empty() {
-                    extra_parts.push(host_str.trim().to_string());
+
+                let curl_progress = drv.curl_progress.as_ref().or_else(|| {
+                    bi.activity_id
+                        .and_then(|id| state.activities.get(&id))
+                        .and_then(|act| act.curl_progress.as_ref())
+                });
+
+                if let Some(cp) = curl_progress {
+                    if cp.total_bytes > 0 || cp.done_bytes > 0 {
+                        let bytes = cp.total_bytes.max(cp.done_bytes);
+                        extra_parts.push(print_bytes(bytes));
+                    }
+                    if cp.host != Host::Localhost {
+                        let h_str = cp.host.hostname_only();
+                        let label = host_abbrevs.get(h_str).map(|s| s.as_str()).unwrap_or(h_str);
+                        extra_parts.push(format!("from {}", label));
+                    }
+                } else {
+                    let host_str = format_single_host(&bi.host, host_abbrevs, false);
+                    if !host_str.is_empty() {
+                        extra_parts.push(host_str.trim().to_string());
+                    }
                 }
+
                 if bi.end - bi.start > 1.0 {
                     extra_parts.push(format!("{} {}", CLOCK, format_duration(bi.end - bi.start)));
                 }
@@ -922,8 +981,19 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
     let num_planned_builds = s.planned_builds.len() as usize;
     let total_builds = num_running_builds + num_completed_builds + num_planned_builds;
 
-    let num_running_dl = s.running_downloads.len();
-    let num_completed_dl = s.completed_downloads.len();
+    let num_curl_running = s
+        .running_builds
+        .keys()
+        .filter(|&&drv_id| state.get_derivation(drv_id).curl_progress.is_some())
+        .count();
+    let num_curl_completed = s
+        .completed_builds
+        .keys()
+        .filter(|&&drv_id| state.get_derivation(drv_id).curl_progress.is_some())
+        .count();
+
+    let num_running_dl = s.running_downloads.len() + num_curl_running;
+    let num_completed_dl = s.completed_downloads.len() + num_curl_completed;
     let num_planned_dl = s.planned_downloads.len() as usize;
     let total_dl = num_running_dl + num_completed_dl + num_planned_dl;
 
@@ -966,37 +1036,124 @@ fn render_summary_table(state: &NomState, now: f64) -> String {
     let mut total_done = 0;
     let mut total_expected = 0;
 
-    for b in s.running_builds.values() {
-        host_stats
-            .entry(b.host.hostname_only())
-            .or_insert_with(|| HostStats {
-                host: &b.host,
-                rb: 0,
-                cb: 0,
-                rd: 0,
-                cd: 0,
-                ru: 0,
-                cu: 0,
-                host_done: 0,
-                host_expected: 0,
-            })
-            .rb += 1;
+    for (drv_id, b) in &s.running_builds {
+        let drv = state.get_derivation(*drv_id);
+        let curl_progress = drv.curl_progress.as_ref().or_else(|| {
+            b.activity_id
+                .and_then(|id| state.activities.get(&id))
+                .and_then(|act| act.curl_progress.as_ref())
+        });
+
+        if let Some(cp) = curl_progress {
+            let stats = host_stats
+                .entry(cp.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &cp.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                });
+            stats.rd += 1;
+            stats.host_done += cp.done_bytes;
+            stats.host_expected += cp.total_bytes;
+            total_done += cp.done_bytes;
+            total_expected += cp.total_bytes;
+
+            host_stats
+                .entry(b.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &b.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                })
+                .rb += 1;
+        } else {
+            host_stats
+                .entry(b.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &b.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                })
+                .rb += 1;
+        }
     }
-    for b in s.completed_builds.values() {
-        host_stats
-            .entry(b.host.hostname_only())
-            .or_insert_with(|| HostStats {
-                host: &b.host,
-                rb: 0,
-                cb: 0,
-                rd: 0,
-                cd: 0,
-                ru: 0,
-                cu: 0,
-                host_done: 0,
-                host_expected: 0,
-            })
-            .cb += 1;
+    for (drv_id, b) in &s.completed_builds {
+        let drv = state.get_derivation(*drv_id);
+        let curl_progress = drv.curl_progress.as_ref().or_else(|| {
+            b.activity_id
+                .and_then(|id| state.activities.get(&id))
+                .and_then(|act| act.curl_progress.as_ref())
+        });
+
+        if let Some(cp) = curl_progress {
+            let stats = host_stats
+                .entry(cp.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &cp.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                });
+            stats.cd += 1;
+            let d_done = cp.total_bytes.max(cp.done_bytes);
+            stats.host_done += d_done;
+            stats.host_expected += cp.total_bytes;
+            total_done += d_done;
+            total_expected += cp.total_bytes;
+
+            host_stats
+                .entry(b.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &b.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                })
+                .cb += 1;
+        } else {
+            host_stats
+                .entry(b.host.hostname_only())
+                .or_insert_with(|| HostStats {
+                    host: &b.host,
+                    rb: 0,
+                    cb: 0,
+                    rd: 0,
+                    cd: 0,
+                    ru: 0,
+                    cu: 0,
+                    host_done: 0,
+                    host_expected: 0,
+                })
+                .cb += 1;
+        }
     }
     for d in s.running_downloads.values() {
         let stats = host_stats

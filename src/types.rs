@@ -183,6 +183,14 @@ impl Host {
         Host::Remote { proto, user, host }
     }
 
+    pub fn fallback_curl() -> Self {
+        Host::Remote {
+            proto: None,
+            user: None,
+            host: CompactString::new("curl"),
+        }
+    }
+
     pub fn hostname_only(&self) -> &str {
         match self {
             Host::Localhost => "localhost",
