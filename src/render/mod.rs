@@ -123,6 +123,15 @@ pub fn render_state_to_text(state: &NomState, config: Config, now: f64) -> Strin
             max_tree_height,
             now,
         ));
+    } else if !state.full_summary.running_downloads.is_empty()
+        || !state.full_summary.running_uploads.is_empty()
+    {
+        sections.push(render_active_transfers(
+            state,
+            term_width.saturating_sub(2),
+            max_tree_height,
+            now,
+        ));
     }
 
     // 4. Summary table section
@@ -278,6 +287,115 @@ fn render_builds(state: &NomState, _max_width: usize, max_height: usize, now: f6
     for (left, _progress_opt) in rows {
         lines.push(left);
     }
+
+    prepend_lines(
+        HORIZONTAL,
+        &format!("{} ", VERTICAL),
+        &format!("{} ", VERTICAL),
+        &lines,
+    )
+}
+
+fn render_active_transfers(
+    state: &NomState,
+    _max_width: usize,
+    max_height: usize,
+    now: f64,
+) -> String {
+    let host_abbrevs = compute_host_abbrevs(state);
+    let mut rows: Vec<String> = Vec::new();
+
+    // 1. Running downloads
+    for (&path_id, dl) in &state.full_summary.running_downloads {
+        let sp = state.get_store_path(path_id);
+        let path_name = &sp.name.name;
+
+        let mut parts = Vec::new();
+        parts.push(format!(
+            "{}{}{} {} {}{}",
+            BOLD, YELLOW, DOWN, RUNNING, path_name, RESET
+        ));
+
+        let host_name = dl.host.hostname_only();
+        let disambiguated = host_abbrevs
+            .get(host_name)
+            .map(|s| s.as_str())
+            .unwrap_or(host_name);
+        parts.push(format!("{}from {}{}", MAGENTA, disambiguated, RESET));
+
+        if now - dl.start > 1.0 {
+            parts.push(format!(
+                "{} {}",
+                CLOCK,
+                format_duration(now - dl.start)
+            ));
+        }
+
+        if let Some(act_id) = dl.activity_id {
+            if let Some(act) = state.activities.get(&act_id) {
+                if let Some(p) = act.file_transfer_progress.as_ref().or(act.progress.as_ref()) {
+                    if p.expected > 0 {
+                        parts.push(format!(
+                            "{}{} {}/{}{}",
+                            GREEN,
+                            DOWN,
+                            print_bytes(p.done),
+                            print_bytes(p.expected),
+                            RESET
+                        ));
+                    }
+                }
+            }
+        }
+
+        rows.push(parts.join(" "));
+        if rows.len() >= max_height {
+            break;
+        }
+    }
+
+    // 2. Running uploads
+    if rows.len() < max_height {
+        for (&path_id, ul) in &state.full_summary.running_uploads {
+            let sp = state.get_store_path(path_id);
+            let path_name = &sp.name.name;
+
+            let mut parts = Vec::new();
+            parts.push(format!(
+                "{}{}{} {} {}{}",
+                BOLD, YELLOW, UP, RUNNING, path_name, RESET
+            ));
+
+            let host_name = ul.host.hostname_only();
+            let disambiguated = host_abbrevs
+                .get(host_name)
+                .map(|s| s.as_str())
+                .unwrap_or(host_name);
+            parts.push(format!("{}to {}{}", MAGENTA, disambiguated, RESET));
+
+            if now - ul.start > 1.0 {
+                parts.push(format!(
+                    "{} {}",
+                    CLOCK,
+                    format_duration(now - ul.start)
+                ));
+            }
+
+            rows.push(parts.join(" "));
+            if rows.len() >= max_height {
+                break;
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let header = format!(" {}Downloads{}:", BOLD, RESET);
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(header);
+    lines.extend(rows);
 
     prepend_lines(
         HORIZONTAL,
@@ -705,7 +823,32 @@ fn format_derivation_row(
                     }
                 }
 
-                if let Some(cp) = curl_progress {
+                let file_transfer_progress = bi
+                    .activity_id
+                    .and_then(|id| state.activities.get(&id))
+                    .and_then(|act| act.file_transfer_progress.as_ref().or(act.progress.as_ref()));
+
+                if let Some(p) = file_transfer_progress {
+                    if p.expected > 0 {
+                        progress_val = Some(p.done as f64 / p.expected as f64);
+                        parts.push(format!(
+                            "{}{} {}/{}{}",
+                            GREEN,
+                            DOWN,
+                            print_bytes(p.done),
+                            print_bytes(p.expected),
+                            RESET
+                        ));
+                    } else if p.done > 0 {
+                        parts.push(format!(
+                            "{}{} {}{}",
+                            GREEN,
+                            DOWN,
+                            print_bytes(p.done),
+                            RESET
+                        ));
+                    }
+                } else if let Some(cp) = curl_progress {
                     if cp.total_bytes > 0 {
                         progress_val = Some(cp.done_bytes as f64 / cp.total_bytes as f64);
                         parts.push(format!(

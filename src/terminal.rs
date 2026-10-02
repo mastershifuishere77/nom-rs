@@ -1,8 +1,6 @@
-use crate::render::table::display_width;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use terminal_size::{terminal_size, Width};
 
 pub const START_ATOMIC_UPDATE: &str = "\x1b[?2026h";
 pub const END_ATOMIC_UPDATE: &str = "\x1b[?2026l";
@@ -40,96 +38,92 @@ impl TerminalRenderer {
         }
     }
 
-    pub fn draw(&mut self, nix_output_lines: &[String], nom_output: &str, pad: bool) {
+    pub fn draw(&mut self, nix_output_lines: &[String], nom_output: &str, _pad: bool) {
         self.finished = false;
         let mut stderr = io::stderr().lock();
-        let nix_lines_count = nix_output_lines.len();
-        let reflow_correction: usize = if nix_lines_count == 0 {
-            0
-        } else {
-            let term_width = if let Some((Width(w), _)) = terminal_size() {
-                if w > 0 {
-                    w as usize
-                } else {
-                    80
-                }
-            } else {
-                80
-            };
-            nix_output_lines
-                .iter()
-                .map(|l| display_width(l) / term_width)
-                .sum()
-        };
-
-        let is_empty = nom_output.trim().is_empty();
-        let nom_lines_count = if is_empty {
-            0
-        } else {
-            nom_output.lines().count()
-        };
-
-        let lines_to_pad = if pad && nom_lines_count > 0 {
-            self.last_printed_line_count
-                .saturating_sub(reflow_correction + nix_lines_count + nom_lines_count)
-        } else {
-            0
-        };
 
         self.buffer.clear();
         let _ = self.buffer.write_all(START_ATOMIC_UPDATE.as_bytes());
 
-        // Clear previous output from screen:
-        if self.last_printed_line_count == 1 {
-            let _ = self.buffer.write_all(CURSOR_TO_COL_0.as_bytes());
-        }
-        if self.last_printed_line_count > 0 {
-            let _ = self.buffer.write_all(CLEAR_LINE.as_bytes());
-        }
+        if !nix_output_lines.is_empty() {
+            // New log lines arrived!
+            // First, erase the previous widget from screen:
+            if self.last_printed_line_count > 1 {
+                for _ in 1..self.last_printed_line_count {
+                    let _ = self.buffer.write_all(CURSOR_PREV_LINE_1.as_bytes());
+                }
+            }
+            if self.last_printed_line_count > 0 {
+                let _ = self.buffer.write_all(CURSOR_TO_COL_0.as_bytes());
+                let _ = self.buffer.write_all(b"\x1b[J"); // clear from cursor to bottom of screen
+            }
 
-        for _ in 1..self.last_printed_line_count {
-            let _ = self.buffer.write_all(CURSOR_PREV_LINE_1.as_bytes());
-            let _ = self.buffer.write_all(CLEAR_LINE.as_bytes());
-        }
+            // Print the new log lines directly:
+            for line in nix_output_lines {
+                let trimmed = line.trim_end_matches('\r');
+                let _ = self.buffer.write_all(trimmed.as_bytes());
+                let _ = self.buffer.write_all(b"\x1b[0m\n");
+            }
 
-        let all_lines = nix_output_lines
-            .iter()
-            .map(|l| l.trim_end_matches('\r'))
-            .chain(std::iter::repeat_n("", lines_to_pad))
-            .chain(if is_empty {
-                "".lines()
+            // Now draw the new nom_output below the log lines:
+            let lines: Vec<&str> = if nom_output.trim().is_empty() {
+                Vec::new()
             } else {
-                nom_output.lines()
-            });
-
-        for (idx, line) in all_lines.enumerate() {
-            if idx == 0 {
-                // Stay in line
-            } else if idx + reflow_correction < self.last_printed_line_count {
-                // Within previously printed area: move down to next line without scrolling!
-                let _ = self.buffer.write_all(CURSOR_NEXT_LINE_1.as_bytes());
+                nom_output.lines().collect()
+            };
+            for (idx, line) in lines.iter().enumerate() {
+                if idx > 0 {
+                    let _ = self.buffer.write_all(b"\n");
+                    let _ = self.buffer.write_all(CURSOR_TO_COL_0.as_bytes());
+                }
+                let _ = self.buffer.write_all(line.as_bytes());
+                let _ = self.buffer.write_all(b"\x1b[K");
+            }
+            self.last_printed_line_count = lines.len();
+        } else {
+            // Normal frame: redraw widget in place without blanking!
+            let lines: Vec<&str> = if nom_output.trim().is_empty() {
+                Vec::new()
             } else {
-                // Exceeded previously printed area: need a newline
-                let _ = self.buffer.write_all(b"\n");
+                nom_output.lines().collect()
+            };
+            let new_count = lines.len();
+
+            if self.last_printed_line_count > 1 {
+                for _ in 1..self.last_printed_line_count {
+                    let _ = self.buffer.write_all(CURSOR_PREV_LINE_1.as_bytes());
+                }
+            }
+            if self.last_printed_line_count > 0 {
                 let _ = self.buffer.write_all(CURSOR_TO_COL_0.as_bytes());
             }
-            let _ = self.buffer.write_all(line.as_bytes());
-            if idx < nix_lines_count && !nix_output_lines.is_empty() {
-                let _ = self.buffer.write_all(b"\x1b[0m");
-            }
-        }
 
-        if nom_lines_count == 0 && nix_lines_count > 0 {
-            let _ = self.buffer.write_all(b"\n");
-            let _ = self.buffer.write_all(CURSOR_TO_COL_0.as_bytes());
+            for (idx, line) in lines.iter().enumerate() {
+                if idx > 0 {
+                    let _ = self.buffer.write_all(CURSOR_NEXT_LINE_1.as_bytes());
+                }
+                let _ = self.buffer.write_all(line.as_bytes());
+                let _ = self.buffer.write_all(b"\x1b[K"); // clear to end of line
+            }
+
+            // If new output has fewer lines, clear the remaining old lines below:
+            if self.last_printed_line_count > new_count {
+                for _ in new_count..self.last_printed_line_count {
+                    let _ = self.buffer.write_all(CURSOR_NEXT_LINE_1.as_bytes());
+                    let _ = self.buffer.write_all(CLEAR_LINE.as_bytes());
+                }
+                for _ in new_count..self.last_printed_line_count {
+                    let _ = self.buffer.write_all(CURSOR_PREV_LINE_1.as_bytes());
+                }
+            }
+
+            self.last_printed_line_count = new_count;
         }
 
         let _ = self.buffer.write_all(END_ATOMIC_UPDATE.as_bytes());
 
         let _ = stderr.write_all(&self.buffer);
         let _ = stderr.flush();
-
-        self.last_printed_line_count = nom_lines_count + lines_to_pad;
     }
 
     pub fn finish(&mut self) {

@@ -253,26 +253,22 @@ pub fn calculate_sort_key(state: &NomState, drv_id: DerivationId) -> SortKey {
 pub fn sort_deps_of_set(state: &mut NomState, touched: &RoaringBitmap) {
     for raw_id in touched.iter() {
         let drv_id = DerivationId(raw_id as usize);
+        if drv_id.0 >= state.derivation_infos.len() {
+            continue;
+        }
         let num_inputs = state.derivation_infos[drv_id.0].input_derivations.len();
         if num_inputs <= 1 {
             continue;
         }
 
-        if num_inputs == 2 {
-            let d0 = state.derivation_infos[drv_id.0].input_derivations[0].derivation;
-            let d1 = state.derivation_infos[drv_id.0].input_derivations[1].derivation;
-            let k0 = calculate_sort_key(state, d0);
-            let k1 = calculate_sort_key(state, d1);
-            if k0 > k1 {
-                state.derivation_infos[drv_id.0]
-                    .input_derivations
-                    .swap(0, 1);
-            }
-            continue;
-        }
-
         let mut deps = std::mem::take(&mut state.derivation_infos[drv_id.0].input_derivations);
-        deps.sort_by_cached_key(|input| calculate_sort_key(state, input.derivation));
+        deps.sort_by(|a, b| {
+            calculate_sort_key(state, a.derivation)
+                .cmp(&calculate_sort_key(state, b.derivation))
+                .then_with(|| {
+                    state.get_derivation(a.derivation).name.cmp(&state.get_derivation(b.derivation).name)
+                })
+        });
         state.derivation_infos[drv_id.0].input_derivations = deps;
     }
 }
@@ -283,7 +279,13 @@ pub fn maintain_nom_state(state: &mut NomState, now: f64) {
         sort_deps_of_set(state, &touched);
 
         let mut roots = std::mem::take(&mut state.forest_roots);
-        roots.sort_by_cached_key(|&r| calculate_sort_key(state, r));
+        roots.sort_by(|a, b| {
+            calculate_sort_key(state, *a)
+                .cmp(&calculate_sort_key(state, *b))
+                .then_with(|| {
+                    state.get_derivation(*a).name.cmp(&state.get_derivation(*b).name)
+                })
+        });
         state.forest_roots = roots;
     }
 

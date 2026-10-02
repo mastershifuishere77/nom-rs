@@ -100,15 +100,25 @@ pub fn monitor_stream<R: Read + Send + 'static>(
     let mut pending_log_lines: Vec<String> = Vec::new();
     let mut last_draw = Instant::now();
     let mut last_rendered_sec: u64 = 0;
+    let mut last_event_now = 0.0f64;
+    let mut next_now = || -> f64 {
+        let raw = start_instant.elapsed().as_secs_f64();
+        if raw <= last_event_now {
+            last_event_now += 1e-9;
+        } else {
+            last_event_now = raw;
+        }
+        last_event_now
+    };
 
     'main_loop: loop {
         select! {
             recv(input_rx) -> event => {
-                let now = start_instant.elapsed().as_secs_f64();
                 let mut current_event = event;
                 let batch_start = Instant::now();
                 let mut batch_count = 0;
                 loop {
+                    let now = next_now();
                     match current_event {
                         Ok(InputEvent::Json(json_msg)) => {
                             let changed = process_json_message(&mut state, json_msg, &watcher, &mut pending_log_lines, now, &reports_writer);
@@ -155,12 +165,13 @@ pub fn monitor_stream<R: Read + Send + 'static>(
                 }
             }
             recv(watcher.event_receiver) -> finished_build => {
-                let now = start_instant.elapsed().as_secs_f64();
+                let now = next_now();
                 if let Ok((host, drv_id)) = finished_build {
                     finish_build_by_drv_id(&mut state, &host, drv_id, now, &reports_writer);
                     dirty = true;
                 }
                 while let Ok((host, drv_id)) = watcher.event_receiver.try_recv() {
+                    let now = next_now();
                     finish_build_by_drv_id(&mut state, &host, drv_id, now, &reports_writer);
                     dirty = true;
                 }
@@ -257,12 +268,42 @@ fn process_json_message(
 
     match msg {
         NixJsonMessage::Message(action) => {
-            if (action.level as u64) <= 3 && (action.level as u64) > 0 {
-                // Info message, pass through
+            let stripped = crate::parser::old_style::strip_ansi_codes(&action.message);
+            let trimmed = stripped.trim();
+            if trimmed.starts_with("error:") {
+                let err_core = trimmed;
+                if !state.nix_errors.iter().any(|e| {
+                    crate::parser::old_style::strip_ansi_codes(e).trim() == err_core
+                }) {
+                    state.nix_errors.push(action.message.clone());
+                }
+                logs.push(action.message.clone());
+                if let Some((NixOldStyleMessage::Failed(drv, fail_type), _)) =
+                    parse_old_style_chunk(&format!("{}\n", stripped))
+                {
+                    let drv_id = lookup_derivation(state, &drv);
+                    mark_failed_build(state, drv_id, fail_type, now);
+                }
+                return true;
+            } else if trimmed.starts_with("trace:") {
+                if !state.nix_traces.iter().any(|t| {
+                    crate::parser::old_style::strip_ansi_codes(t).trim() == trimmed
+                }) {
+                    state.nix_traces.push(action.message.clone());
+                }
+                logs.push(action.message.clone());
+                return true;
+            } else if action.message.starts_with("evaluating file '") {
+                if let Some(suffix) = action.message.strip_prefix("evaluating file '") {
+                    let file_name = suffix.trim_end_matches('\'').to_string();
+                    state.evaluation_state.count += 1;
+                    state.evaluation_state.last_file_name = Some(file_name);
+                    state.evaluation_state.at = now;
+                    return true;
+                }
+            } else if (action.level as u64) <= 3 && (action.level as u64) > 0 {
                 logs.push(action.message.clone());
 
-                // Check for indented store object in plan
-                let trimmed = action.message.trim();
                 if trimmed.starts_with("/nix/store/") {
                     if let Some(drv) = Derivation::parse(trimmed) {
                         let drv_id = lookup_derivation(state, &drv);
@@ -277,38 +318,6 @@ fn process_json_message(
                         update_store_path_states(state, path_id, old_states, new_states);
                         return true;
                     }
-                }
-            } else if (action.level as u64) == 0 {
-                // Error message
-                let stripped = crate::parser::old_style::strip_ansi_codes(&action.message);
-                if stripped.starts_with("error:") {
-                    let err_core = stripped.trim();
-                    if !state.nix_errors.iter().any(|e| e.contains(err_core)) {
-                        state.nix_errors.push(action.message.clone());
-                        logs.push(action.message.clone());
-                    }
-                    // Attempt old-style parse to catch builder failure
-                    if let Some((NixOldStyleMessage::Failed(drv, fail_type), _)) =
-                        parse_old_style_chunk(&format!("{}\n", stripped))
-                    {
-                        let drv_id = lookup_derivation(state, &drv);
-                        mark_failed_build(state, drv_id, fail_type, now);
-                    }
-                    return true;
-                } else if stripped.starts_with("trace:") {
-                    if !state.nix_traces.iter().any(|t| t.contains(&*stripped)) {
-                        state.nix_traces.push(action.message.clone());
-                        logs.push(action.message.clone());
-                    }
-                    return true;
-                }
-            } else if action.message.starts_with("evaluating file '") {
-                if let Some(suffix) = action.message.strip_prefix("evaluating file '") {
-                    let file_name = suffix.trim_end_matches('\'').to_string();
-                    state.evaluation_state.count += 1;
-                    state.evaluation_state.last_file_name = Some(file_name);
-                    state.evaluation_state.at = now;
-                    return true;
                 }
             }
             false
@@ -389,13 +398,46 @@ fn process_json_message(
             }
             crate::parser::json::ActivityResult::Progress(progress) => {
                 let mut changed = false;
+
+                // Find store path associated with this download activity to maintain its known total size
+                let copy_path_opt = state
+                    .activity_parents
+                    .get(&action.id)
+                    .and_then(|p_id| state.activities.get(p_id))
+                    .or_else(|| state.activities.get(&action.id))
+                    .and_then(|act| match &act.activity {
+                        Activity::CopyPath { path, .. } => Some(path.clone()),
+                        _ => None,
+                    });
+
+                let known_max = if let Some(path) = copy_path_opt {
+                    let path_id = state.get_store_path_id(&path);
+                    let entry = state
+                        .max_download_sizes
+                        .entry(path_id)
+                        .or_insert(progress.expected);
+                    *entry = (*entry).max(progress.expected);
+                    *entry
+                } else {
+                    progress.expected
+                };
+
                 if let Some(act) = state.activities.get_mut(&action.id) {
-                    act.progress = Some(progress.clone());
+                    let prev_expected = act.progress.as_ref().map_or(0, |p| p.expected);
+                    let mut p = progress.clone();
+                    p.expected = p.expected.max(prev_expected).max(known_max);
+                    act.progress = Some(p);
                     changed = true;
                 }
                 if let Some(&parent_id) = state.activity_parents.get(&action.id) {
                     if let Some(parent_act) = state.activities.get_mut(&parent_id) {
-                        parent_act.file_transfer_progress = Some(progress);
+                        let prev_expected = parent_act
+                            .file_transfer_progress
+                            .as_ref()
+                            .map_or(0, |p| p.expected);
+                        let mut p = progress;
+                        p.expected = p.expected.max(prev_expected).max(known_max);
+                        parent_act.file_transfer_progress = Some(p);
                         changed = true;
                     }
                 }
@@ -426,6 +468,7 @@ fn process_json_message(
                         false
                     }
                 }
+                Activity::FileTransfer(_) => true,
                 _ => false,
             };
 
@@ -481,10 +524,32 @@ fn process_json_message(
             false
         }
         NixJsonMessage::Plain(raw) => {
+            let stripped = crate::parser::old_style::strip_ansi_codes(&raw);
+            let trimmed = stripped.trim();
+            if trimmed.starts_with("error:") {
+                let err_core = trimmed;
+                if !state.nix_errors.iter().any(|e| {
+                    crate::parser::old_style::strip_ansi_codes(e).trim() == err_core
+                }) {
+                    state.nix_errors.push(raw.clone());
+                }
+                if let Some((NixOldStyleMessage::Failed(drv, fail_type), _)) =
+                    parse_old_style_chunk(&format!("{}\n", stripped))
+                {
+                    let drv_id = lookup_derivation(state, &drv);
+                    mark_failed_build(state, drv_id, fail_type, now);
+                }
+            } else if trimmed.starts_with("trace:")
+                && !state.nix_traces.iter().any(|t| {
+                    crate::parser::old_style::strip_ansi_codes(t).trim() == trimmed
+                })
+            {
+                state.nix_traces.push(raw.clone());
+            }
             if !raw.starts_with("debug: nixos_rebuild.") {
                 logs.push(raw);
             }
-            false
+            true
         }
         NixJsonMessage::ParseError(err) => {
             logs.push(format!("nom-rs parse error: {}", err));
@@ -582,6 +647,21 @@ fn process_old_style_message(
         let stripped = crate::parser::old_style::strip_ansi_codes(&raw_line);
         let trimmed = stripped.trim();
 
+        if trimmed.starts_with("error:") {
+            let err_core = trimmed;
+            if !state.nix_errors.iter().any(|e| {
+                crate::parser::old_style::strip_ansi_codes(e).trim() == err_core
+            }) {
+                state.nix_errors.push(raw_line.clone());
+            }
+        } else if trimmed.starts_with("trace:")
+            && !state.nix_traces.iter().any(|t| {
+                crate::parser::old_style::strip_ansi_codes(t).trim() == trimmed
+            })
+        {
+            state.nix_traces.push(raw_line.clone());
+        }
+
         if let Some(idx) = trimmed.find("> ") {
             let prefix = &trimmed[..idx];
             let body = &trimmed[idx + 2..];
@@ -619,7 +699,7 @@ fn process_old_style_message(
                             .curl_progress
                             .get_or_insert_with(CurlProgress::new_fallback);
                         d_cp.done_bytes = snap.done_bytes;
-                        d_cp.total_bytes = snap.total_bytes;
+                        d_cp.total_bytes = d_cp.total_bytes.max(snap.total_bytes);
                     }
                     logs.push(raw_line);
                     return true;
@@ -716,15 +796,28 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
         }
 
         let mut input_derivations = Vec::with_capacity(parsed.input_drvs.len());
+        let mut children_needing_propagation = Vec::new();
         for (dep_drv, dep_outputs) in parsed.input_drvs {
             let dep_id = lookup_derivation(state, &dep_drv);
             let dep_mut = state.get_derivation_mut(dep_id);
             let was_first_parent = dep_mut.derivation_parents.is_empty();
-            dep_mut.derivation_parents.insert(drv_id);
+            let is_new_link = dep_mut.derivation_parents.insert(drv_id);
             if was_first_parent && dep_mut.is_root {
                 dep_mut.is_root = false;
                 if let Some(pos) = state.forest_roots.iter().position(|&r| r == dep_id) {
                     state.forest_roots.swap_remove(pos);
+                }
+            }
+            // If this is a newly created parent link and the child has a
+            // non-empty summary (status changes already happened), we need
+            // to propagate the child's summary upward into the new parent
+            // chain so that sort keys reflect the full subtree.
+            if is_new_link {
+                let dep = state.get_derivation(dep_id);
+                if !dep.dependency_summary.is_empty()
+                    || !matches!(dep.build_status, BuildStatus::Unknown)
+                {
+                    children_needing_propagation.push(dep_id);
                 }
             }
             input_derivations.push(InputDerivation {
@@ -732,17 +825,46 @@ pub fn lookup_derivation(state: &mut NomState, drv: &Derivation) -> DerivationId
                 outputs: dep_outputs.into_iter().collect(),
             });
         }
+        // Propagate pre-existing child summaries up the new parent chain.
+        for child_id in children_needing_propagation {
+            let child_summary = state.get_derivation(child_id).dependency_summary.clone();
+            let child_status = state.get_derivation(child_id).build_status.clone();
+            // Merge child's own build status into drv_id's summary
+            if !matches!(child_status, BuildStatus::Unknown) {
+                NomState::update_summary_for_derivation_opt(
+                    &mut state.get_derivation_mut(drv_id).dependency_summary,
+                    &BuildStatus::Unknown,
+                    &child_status,
+                    child_id,
+                    false,
+                );
+            }
+            // Merge child's dependency_summary into drv_id's summary
+            state.get_derivation_mut(drv_id).dependency_summary.merge(&child_summary);
+        }
+        input_derivations.sort_by(|a, b| {
+            state.get_derivation(a.derivation).name.cmp(&state.get_derivation(b.derivation).name)
+        });
 
-        let drv_mut = state.get_derivation_mut(drv_id);
-        drv_mut.outputs = output_map;
-        drv_mut.input_sources = input_sources;
-        drv_mut.input_derivations = input_derivations;
-        drv_mut.cached = true;
-        drv_mut.platform = Some(parsed.platform);
-        drv_mut.pname = parsed.pname;
+        let is_root_needed = {
+            let drv_mut = state.get_derivation_mut(drv_id);
+            drv_mut.outputs = output_map;
+            drv_mut.input_sources = input_sources;
+            drv_mut.input_derivations = input_derivations;
+            drv_mut.cached = true;
+            drv_mut.platform = Some(parsed.platform);
+            drv_mut.pname = parsed.pname;
 
-        if drv_mut.derivation_parents.is_empty() && !drv_mut.is_root {
-            drv_mut.is_root = true;
+            if drv_mut.derivation_parents.is_empty() && !drv_mut.is_root {
+                drv_mut.is_root = true;
+                true
+            } else {
+                false
+            }
+        };
+        state.touched_ids.insert(drv_id.0 as u32);
+
+        if is_root_needed {
             state.forest_roots.push(drv_id);
         }
         return drv_id;

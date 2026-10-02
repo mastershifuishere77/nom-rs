@@ -951,12 +951,12 @@ fn test_localhost_presence_and_order_before_builds() {
         "Table must display cache.nixos.org"
     );
 
-    // localhost must appear BEFORE cache.nixos.org
+    // localhost must appear BEFORE cache.nixos.org in the host table
     let pos_localhost = rendered.find("localhost").unwrap();
-    let pos_cache = rendered.find("cache.nixos.org").unwrap();
+    let pos_cache = rendered.rfind("cache.nixos.org").unwrap();
     assert!(
         pos_localhost < pos_cache,
-        "localhost (pos {}) must appear before cache.nixos.org (pos {})",
+        "localhost (pos {}) must appear before cache.nixos.org (pos {}) in table",
         pos_localhost,
         pos_cache
     );
@@ -1699,5 +1699,91 @@ fn test_env_parse_nom_options() {
         std::env::remove_var("NOM_HOST_CAP");
     }
 }
+
+#[test]
+fn test_download_expected_size_retained_on_retry() {
+    use nix_output_monitor::engine::monitor_stream;
+    use nix_output_monitor::render::Config;
+    use std::io::Cursor;
+
+    let json_stream = r#"@nix {"action":"start","id":10,"level":4,"parent":0,"text":"copying path '/nix/store/894zv7pm5ggbdysrfgl6mj91a8x8qzc4-linux-firmware' from 'https://cache.nixos.org'","type":100,"fields":["/nix/store/894zv7pm5ggbdysrfgl6mj91a8x8qzc4-linux-firmware","https://cache.nixos.org",""]}
+@nix {"action":"start","id":11,"level":4,"parent":10,"text":"fetching nar","type":101,"fields":["https://cache.nixos.org/nar/123.nar.zst"]}
+@nix {"action":"result","id":11,"type":105,"fields":[186000000,804000000,0,0]}
+@nix {"action":"msg","level":1,"msg":"warning: unable to download 'https://cache.nixos.org/nar/123.nar.zst': HTTP error 200; retrying from offset 186000000"}
+@nix {"action":"result","id":11,"type":105,"fields":[0,618000000,0,0]}
+"#;
+
+    let config = Config::default();
+    let state = monitor_stream(Cursor::new(json_stream.as_bytes()), true, config);
+
+    let parent_act = state.activities.get(&10).expect("parent activity must exist");
+    let prog = parent_act
+        .file_transfer_progress
+        .as_ref()
+        .expect("must have file_transfer_progress");
+
+    assert_eq!(
+        prog.expected, 804000000,
+        "Expected download size must NOT drop to remaining chunk (618MB) on retry"
+    );
+}
+
+#[test]
+fn test_errors_captured_into_nix_errors_from_plain_and_json() {
+    use nix_output_monitor::engine::monitor_stream;
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use std::io::Cursor;
+
+    let input_stream = "error: unable to download 'https://cache.nixos.org/nar/1.nar.zst': HTTP error 206 (curl error: Failed sending data to the peer)\n@nix {\"action\":\"msg\",\"level\":0,\"msg\":\"error: unable to download 'https://cache.nixos.org/nar/2.nar.zst': HTTP error 206\"}\n";
+
+    let config = Config::default();
+    let state = monitor_stream(Cursor::new(input_stream.as_bytes()), true, config);
+
+    assert_eq!(state.nix_errors.len(), 2, "Both plain and JSON errors must be captured in nix_errors");
+    let rendered = render_state_to_text(&state, config, 1.0);
+    assert!(rendered.contains("2 Errors:"), "Rendered output must display '2 Errors:':\n{}", rendered);
+}
+
+#[test]
+fn test_parse_builtin_fetcher_derivation() {
+    use nix_output_monitor::parser::derivation::parse_derivation_content;
+    use nix_output_monitor::types::OutputName;
+
+    let drv_content = r#"Derive([("out","/nix/store/anjj2gxcivlzcpz0idsvz202i2vnxyn9-libxcrypt-4.5.2.tar.xz","sha256","71513a31c01a428bccd5367a32fd95f115d6dac50fb5b60c779d5c7942aec071")],[],[],"builtin","builtin:fetchurl",[],[("builder","builtin:fetchurl"),("executable",""),("impureEnvVars","http_proxy https_proxy ftp_proxy all_proxy no_proxy"),("name","libxcrypt-4.5.2.tar.xz"),("out","/nix/store/anjj2gxcivlzcpz0idsvz202i2vnxyn9-libxcrypt-4.5.2.tar.xz"),("outputHash","sha256-cVE6McAaQovM1TZ6Mv2V8RXW2sUPtbYMd51ceUKuwHE="),("outputHashAlgo",""),("outputHashMode","flat"),("preferLocalBuild","1"),("system","builtin"),("unpack",""),("url","https://github.com/besser82/libxcrypt/releases/download/v4.5.2/libxcrypt-4.5.2.tar.xz"),("urls","https://github.com/besser82/libxcrypt/releases/download/v4.5.2/libxcrypt-4.5.2.tar.xz")])"#;
+
+    let parsed = parse_derivation_content(drv_content).expect("Must parse builtin:fetchurl derivation");
+    assert_eq!(parsed.platform, "builtin");
+    assert_eq!(parsed.pname, Some("libxcrypt-4.5.2.tar.xz".to_string()));
+    assert!(parsed.outputs.contains_key(&OutputName::parse("out")));
+
+    // Test CA derivation with empty string in outputs table recovered from env
+    let ca_content = r#"Derive([("out","","","")],[],[],"builtin","builtin:fetchurl",[],[("builder","builtin:fetchurl"),("name","test-ca"),("out","/nix/store/iz25ayazkdr0gsy0qqfd923vbpam90kd-test-ca"),("outputHashAlgo","sha256"),("outputHashMode","flat"),("system","builtin")])"#;
+    let parsed_ca = parse_derivation_content(ca_content).expect("Must parse CA derivation with empty output");
+    assert_eq!(parsed_ca.pname, Some("test-ca".to_string()));
+    assert!(parsed_ca.outputs.contains_key(&OutputName::parse("out")), "Output must be recovered from env when empty in outputs table");
+}
+
+#[test]
+fn test_builtin_fetcher_build_displays_transfer_progress() {
+    use nix_output_monitor::engine::monitor_stream;
+    use nix_output_monitor::render::{render_state_to_text, Config};
+    use std::io::Cursor;
+
+    let stream = r#"@nix {"action":"start","id":100,"level":0,"parent":0,"text":"building '/nix/store/55d91flpk4776srkw66wdx69wll7b5zr-libxcrypt-4.5.2.tar.xz.drv'","type":105,"fields":["/nix/store/55d91flpk4776srkw66wdx69wll7b5zr-libxcrypt-4.5.2.tar.xz.drv","localhost"]}
+@nix {"action":"start","id":101,"level":4,"parent":100,"text":"fetching 'https://github.com/besser82/libxcrypt/releases/download/v4.5.2/libxcrypt-4.5.2.tar.xz'","type":101,"fields":["https://github.com/besser82/libxcrypt/releases/download/v4.5.2/libxcrypt-4.5.2.tar.xz"]}
+@nix {"action":"result","id":101,"type":105,"fields":[524288,1048576,0,0]}
+"#;
+
+    let config = Config::default();
+    let state = monitor_stream(Cursor::new(stream.as_bytes()), true, config);
+    let rendered = render_state_to_text(&state, config, 2.0);
+    assert!(
+        rendered.contains("512.0 KiB/1.0 MiB"),
+        "Rendered output must show file transfer progress on builtin fetcher build: {}",
+        rendered
+    );
+}
+
+
 
 

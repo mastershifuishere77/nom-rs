@@ -269,8 +269,9 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
     lexer.expect(b']')?;
     lexer.expect(b',')?;
 
-    // 7. env: [ ("key", "val"), ... ] (only extract pname, skip all other values)
+    // 7. env: [ ("key", "val"), ... ] (extract pname or fallback to name, and recover output store paths if empty in outputs)
     let mut pname = None;
+    let mut fallback_name = None;
     lexer.expect(b'[')?;
     if lexer.peek() != Some(b']') {
         loop {
@@ -279,6 +280,15 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
             lexer.expect(b',')?;
             if key == "pname" {
                 pname = Some(lexer.parse_string()?);
+            } else if key == "name" {
+                fallback_name = Some(lexer.parse_string()?);
+            } else if (key == "out" || key.starts_with("out"))
+                && !outputs.contains_key(&OutputName::parse(&key))
+            {
+                let val = lexer.parse_string()?;
+                if let Some(sp) = StorePath::parse(&val) {
+                    outputs.insert(OutputName::parse(&key), sp);
+                }
             } else {
                 lexer.skip_string()?;
             }
@@ -293,6 +303,10 @@ pub fn parse_derivation_content(content: &str) -> Result<ParsedDerivation, Deriv
     }
     lexer.expect(b']')?;
     lexer.expect(b')')?;
+
+    if pname.is_none() {
+        pname = fallback_name;
+    }
 
     Ok(ParsedDerivation {
         outputs,
